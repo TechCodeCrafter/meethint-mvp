@@ -6,6 +6,7 @@ import { extractiveAnswer, type Answer } from "@/lib/answer";
 import { loadGitHub, loadUploaded, filesFromDrop } from "@/lib/loaders";
 import { DEMO_FILES } from "@/lib/demo";
 import { PROVIDERS, type ProviderId } from "@/lib/providers";
+import { Mic, Stop, Github, Folder, FileIcon, Code, Sparkle, Gear, X, Copy, Check, External, Chevron, Search, Sun, Moon, Lock, Arrow, Monitor, Layers, Reply, Menu, Bolt } from "./icons";
 import { Listener, BrowserSpeech, NoAudioError, canCaptureMeetingAudio, hasBrowserSpeech, heuristicQuestions, type ListenMode } from "@/lib/listen";
 
 type Source = {
@@ -459,323 +460,516 @@ export default function Page() {
   const suggestions = sources.some((s) => s.kind === "demo") ? DEMO_QUESTIONS : [];
   const engine = stt ? `${stt.provider === "groq" ? "Groq Whisper" : "OpenAI"} transcription` : hasBrowserSpeech() ? "free browser speech (mic only)" : "no speech engine";
 
+  // ---------- UI-only state ----------
+  const [theme, setTheme] = useState<"light" | "dark">("dark");
+  const [ghOpen, setGhOpen] = useState(false);
+  const [listenSetup, setListenSetup] = useState(false);
+  const [dragging, setDragging] = useState(false);
+  const [navOpen, setNavOpen] = useState(false);
+  const [startedAt, setStartedAt] = useState(0);
+  const dragDepth = useRef(0);
+
+  useEffect(() => {
+    const m = window.matchMedia("(prefers-color-scheme: light)");
+    setTheme(m.matches ? "light" : "dark");
+  }, []);
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+  }, [theme]);
+  useEffect(() => {
+    if (listening) setStartedAt(Date.now());
+  }, [listening]);
+
+  // Drop files anywhere on the page
+  useEffect(() => {
+    const isFiles = (e: DragEvent) => !!e.dataTransfer && [...e.dataTransfer.types].includes("Files");
+    const enter = (e: DragEvent) => {
+      if (!isFiles(e)) return;
+      e.preventDefault();
+      dragDepth.current++;
+      setDragging(true);
+    };
+    const over = (e: DragEvent) => isFiles(e) && e.preventDefault();
+    const leave = (e: DragEvent) => {
+      if (!isFiles(e)) return;
+      dragDepth.current = Math.max(0, dragDepth.current - 1);
+      if (!dragDepth.current) setDragging(false);
+    };
+    const drop = async (e: DragEvent) => {
+      if (!isFiles(e)) return;
+      e.preventDefault();
+      dragDepth.current = 0;
+      setDragging(false);
+      handleFilesRef.current(await filesFromDrop(e.dataTransfer!));
+    };
+    window.addEventListener("dragenter", enter);
+    window.addEventListener("dragover", over);
+    window.addEventListener("dragleave", leave);
+    window.addEventListener("drop", drop);
+    return () => {
+      window.removeEventListener("dragenter", enter);
+      window.removeEventListener("dragover", over);
+      window.removeEventListener("dragleave", leave);
+      window.removeEventListener("drop", drop);
+    };
+  }, []);
+  const handleFilesRef = useRef(handleFiles);
+  handleFilesRef.current = handleFiles;
+
+  // Keyboard shortcuts: ⌘K or / focus · L listen · Esc close
+  const kbRef = useRef<(e: KeyboardEvent) => void>(() => {});
+  kbRef.current = (e: KeyboardEvent) => {
+    const t = e.target as HTMLElement;
+    const typing = t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable);
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+      e.preventDefault();
+      qRef.current?.focus();
+      return;
+    }
+    if (e.key === "Escape") {
+      setShowAI(false);
+      setListenSetup(false);
+      setGhOpen(false);
+      setNavOpen(false);
+      return;
+    }
+    if (typing || e.metaKey || e.ctrlKey || e.altKey) return;
+    if (e.key === "/") {
+      e.preventDefault();
+      qRef.current?.focus();
+    } else if (e.key.toLowerCase() === "l" && hasSource) {
+      e.preventDefault();
+      listening ? stopListening() : setListenSetup(true);
+    }
+  };
+  useEffect(() => {
+    const h = (e: KeyboardEvent) => kbRef.current(e);
+    window.addEventListener("keydown", h);
+    return () => window.removeEventListener("keydown", h);
+  }, []);
+
+  // auto-grow question box
+  useEffect(() => {
+    const el = qRef.current;
+    if (!el) return;
+    el.style.height = "0px";
+    el.style.height = Math.min(180, el.scrollHeight) + "px";
+  }, [question]);
+
+  const elapsed = listening ? Math.max(0, Math.floor((now - startedAt) / 1000)) : 0;
+  const mmss = `${String(Math.floor(elapsed / 60)).padStart(2, "0")}:${String(elapsed % 60).padStart(2, "0")}`;
+  const showLive = listening || segs.length > 0;
+  const modeInfo: Record<ListenMode, { title: string; desc: string; icon: React.ReactNode }> = {
+    meeting: { title: "Meeting audio", desc: "Share the Meet / Teams / Zoom tab with “Also share tab audio”. Best quality.", icon: <Monitor size={20} /> },
+    both: { title: "Meeting audio + my mic", desc: "Also catches questions you ask out loud.", icon: <Layers size={20} /> },
+    mic: { title: "My microphone", desc: "Hears the room or your speakers. Works anywhere.", icon: <Mic size={20} /> },
+  };
+
   return (
-    <div className="wrap">
-      <header className="top">
-        <div className="brand">
-          <span className="mark" aria-hidden>?</span>
-          Code Meeting Answerer
-        </div>
-        <div className="top-right">
-          <span className="pill hide-sm" title="No login, no database. Closing the tab clears everything.">
-            <span className="dot" />Session only · nothing saved
-          </span>
-          <button className={`btn sm ${aiReady ? "on" : ""}`} onClick={() => setShowAI((s) => !s)} aria-expanded={showAI}>
-            {aiReady ? "AI: on" : "AI: off"}
-          </button>
-        </div>
-      </header>
-
-      {showAI && (
-        <section className="card settings" aria-label="AI settings">
-          <p className="section-label">AI answers</p>
-          <p className="hint" style={{ marginTop: 0 }}>
-            Without a key, answers are pulled straight from the matching code (instant, nothing leaves your browser). With a key you get written explanations, smarter search, and question
-            detection from meeting audio. Keys live only in this tab&apos;s memory and are passed to the provider per request; they are never stored.
-          </p>
-          <div className="grid">
-            <select value={provider} onChange={(e) => setProvider(e.target.value as ProviderId)} aria-label="Provider">
-              {(Object.keys(PROVIDERS) as ProviderId[]).map((p) => (
-                <option key={p} value={p}>{PROVIDERS[p].label}</option>
-              ))}
-            </select>
-            <input className="input" type="password" autoComplete="off" placeholder={server.server.includes(provider) ? "Using server key (optional override)" : "API key"} value={apiKey} onChange={(e) => setApiKey(e.target.value)} aria-label="API key" />
-            <input className="input" placeholder={`Model (default ${PROVIDERS[provider].model})`} value={model} onChange={(e) => setModel(e.target.value)} aria-label="Model" />
-          </div>
-          <p className="section-label" style={{ marginTop: 16 }}>Transcription (for listening)</p>
-          <p className="hint" style={{ marginTop: 0 }}>
-            {provider === "openai" || provider === "groq"
-              ? "Uses the key above automatically. Override here if you want a different one."
-              : "Anthropic and xAI don't transcribe audio. Add an OpenAI or Groq key to listen to meeting audio."}
-          </p>
-          <div className="grid two">
-            <select value={sttProvider} onChange={(e) => setSttProvider(e.target.value as any)} aria-label="Transcription provider">
-              <option value="openai">OpenAI (gpt-4o-mini-transcribe)</option>
-              <option value="groq">Groq (Whisper large v3 turbo)</option>
-            </select>
-            <input className="input" type="password" autoComplete="off" placeholder="Transcription key (optional)" value={sttKey} onChange={(e) => setSttKey(e.target.value)} aria-label="Transcription key" />
-          </div>
-          <p className="ok">
-            {aiReady ? "AI answers on." : "AI answers off."} Listening engine: {engine}.
-          </p>
-        </section>
-      )}
-
-      {/* ---------- sources ---------- */}
-      <section className="card source" aria-label="Your code and documents">
-        <div className="source-head">
-          <p className="section-label" style={{ margin: 0 }}>1 · Code &amp; documents</p>
-          {hasSource && (
-            <span className="meta">
-              {totals.files.toLocaleString()} files{totals.docs ? ` (${totals.docs} docs)` : ""} · {totals.lines.toLocaleString()} lines indexed
+    <div className={`app ${navOpen ? "nav-open" : ""}`}>
+      {/* ================= SIDEBAR ================= */}
+      <aside className="side" aria-label="Knowledge sources">
+        <div className="side-top">
+          <div className="brand">
+            <span className="logo" aria-hidden>
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="m8 8-4 4 4 4M16 8l4 4-4 4" /></svg>
             </span>
-          )}
+            <div>
+              <div className="brand-name">Code Meeting Answerer</div>
+              <div className="brand-sub">Live answers from your code</div>
+            </div>
+          </div>
+          <button className="icon-btn only-mobile" onClick={() => setNavOpen(false)} aria-label="Close sources"><X /></button>
         </div>
 
-        {hasSource && (
-          <ul className="srcs">
+        <div className="side-section">
+          <div className="side-label">
+            <span>Knowledge</span>
+            {hasSource && <span className="count">{totals.files.toLocaleString()} files</span>}
+          </div>
+
+          {sources.length === 0 && !progress && <p className="side-empty">Nothing connected yet. Add a repo, folders, files or docs.</p>}
+
+          <ul className="src-list">
             {sources.map((s) => (
-              <li key={s.id}>
-                <span className="status-dot" />
-                <span className="sname">{s.label}</span>
-                {s.ref && <span className="meta">@{s.ref}</span>}
-                <span className="meta">
-                  {s.files.length.toLocaleString()} files{s.docs ? ` · ${s.docs} docs` : ""}
-                  {s.skipped ? ` · ${s.skipped.toLocaleString()} skipped` : ""}
-                  {s.truncated ? " · partially indexed" : ""}
-                </span>
-                <button className="x" onClick={() => removeSource(s.id)} aria-label={`Remove ${s.label}`} title="Remove">×</button>
+              <li key={s.id} className="src-item">
+                <span className={`src-ico ${s.kind}`}>{s.kind === "github" ? <Github size={15} /> : s.kind === "demo" ? <Sparkle size={15} /> : <Folder size={15} />}</span>
+                <div className="src-body">
+                  <div className="src-name" title={s.label}>{s.label}</div>
+                  <div className="src-meta">
+                    {s.files.length.toLocaleString()} files{s.docs ? ` · ${s.docs} docs` : ""}
+                    {s.ref ? ` · ${s.ref}` : ""}
+                    {s.truncated ? " · partial" : ""}
+                  </div>
+                </div>
+                <button className="icon-btn sm" onClick={() => removeSource(s.id)} aria-label={`Remove ${s.label}`} title="Remove"><X size={14} /></button>
               </li>
             ))}
           </ul>
-        )}
-        {hasSource && !addOpen && (
-          <button className="btn sm" onClick={() => setAddOpen(true)} style={{ marginTop: 10 }}>+ Add more files, folders or repos</button>
-        )}
 
-        {addOpen && (
-          <div style={{ marginTop: hasSource ? 14 : 10 }}>
-            <div className="tabs" role="tablist">
-              {(["github", "upload", "demo"] as const).map((t) => (
-                <button key={t} role="tab" className="tab" aria-selected={tab === t} onClick={() => setTab(t)}>
-                  {t === "github" ? "GitHub repo" : t === "upload" ? "Files, folders & docs" : "Try a demo"}
-                </button>
-              ))}
-              {hasSource && <button className="tab" onClick={() => setAddOpen(false)}>Done</button>}
+          {progress && (
+            <div className="side-progress" role="status">
+              <div className="bar"><i style={{ width: `${progress.pct}%` }} /></div>
+              <span>{progress.msg}</span>
             </div>
+          )}
+          {loadError && <div className="alert danger sm" role="alert">{loadError}<button className="icon-btn sm" onClick={() => setLoadError("")} aria-label="Dismiss"><X size={13} /></button></div>}
 
-            {tab === "github" && (
-              <div>
-                <form className="row" onSubmit={(e) => { e.preventDefault(); connectGitHub(); }}>
-                  <input className="input mono" placeholder="https://github.com/owner/repo  or  owner/repo" value={repoInput} onChange={(e) => setRepoInput(e.target.value)} aria-label="GitHub repository" autoCapitalize="off" autoCorrect="off" spellCheck={false} />
-                  <button className="btn primary" disabled={!repoInput.trim() || !!progress}>Connect</button>
-                </form>
-                <div className="chips">
-                  <span className="hint" style={{ margin: 0 }}>Try:</span>
-                  {EXAMPLE_REPOS.map((r) => (
-                    <button key={r} className="chip mono" onClick={() => connectGitHub(r)} disabled={!!progress}>{r}</button>
+          <div className="add-grid">
+            <button className={`add-btn ${ghOpen ? "active" : ""}`} onClick={() => setGhOpen((o) => !o)} disabled={!!progress}>
+              <Github size={16} /> GitHub repo
+            </button>
+            <button className="add-btn" onClick={() => folderRef.current?.click()} disabled={!!progress}>
+              <Folder size={16} /> Folder
+            </button>
+            <button className="add-btn" onClick={() => filesRef.current?.click()} disabled={!!progress}>
+              <FileIcon size={16} /> Files & docs
+            </button>
+            <button className="add-btn" onClick={loadDemo} disabled={!!progress}>
+              <Sparkle size={16} /> Demo
+            </button>
+          </div>
+          <input ref={folderRef} type="file" multiple hidden onChange={(e) => handleFiles([...(e.target.files || [])])} />
+          <input ref={filesRef} type="file" multiple hidden accept={ACCEPT} onChange={(e) => handleFiles([...(e.target.files || [])])} />
+
+          {ghOpen && (
+            <form className="gh-form" onSubmit={(e) => { e.preventDefault(); connectGitHub(); setGhOpen(false); }}>
+              <input
+                autoFocus
+                className="field mono"
+                placeholder="owner/repo or GitHub URL"
+                value={repoInput}
+                onChange={(e) => setRepoInput(e.target.value)}
+                aria-label="GitHub repository"
+                autoCapitalize="off"
+                autoCorrect="off"
+                spellCheck={false}
+              />
+              <input className="field mono" type="password" autoComplete="off" placeholder="Token for private repos (optional)" value={ghToken} onChange={(e) => setGhToken(e.target.value)} aria-label="GitHub token" />
+              <button className="btn primary block" disabled={!repoInput.trim()}>Connect repository</button>
+              <div className="gh-try">
+                {EXAMPLE_REPOS.map((r) => (
+                  <button type="button" key={r} className="tiny-chip" onClick={() => { connectGitHub(r); setGhOpen(false); }}>{r}</button>
+                ))}
+              </div>
+            </form>
+          )}
+          <p className="side-hint">Drop folders, files, PDFs or .zip anywhere on the page. Dependencies and build folders are skipped.</p>
+        </div>
+
+        <div className="side-bottom">
+          <button className={`ai-card ${aiReady ? "on" : ""}`} onClick={() => setShowAI(true)}>
+            <span className="ai-dot" />
+            <div>
+              <div className="ai-title">{aiReady ? `AI answers on` : "AI answers off"}</div>
+              <div className="ai-sub">{aiReady ? `${PROVIDERS[provider].label}${stt ? " · transcription ready" : ""}` : "Add a key for written answers & listening"}</div>
+            </div>
+            <Gear size={16} />
+          </button>
+          <div className="side-foot">
+            <span><Lock size={13} /> Session only · nothing saved</span>
+            <button className="icon-btn sm" onClick={() => setTheme((t) => (t === "dark" ? "light" : "dark"))} aria-label="Toggle theme" title="Toggle theme">
+              {theme === "dark" ? <Sun size={15} /> : <Moon size={15} />}
+            </button>
+          </div>
+        </div>
+      </aside>
+      {navOpen && <div className="scrim only-mobile" onClick={() => setNavOpen(false)} />}
+
+      {/* ================= MAIN ================= */}
+      <main className="main">
+        <div className="mobile-bar only-mobile">
+          <button className="icon-btn" onClick={() => setNavOpen(true)} aria-label="Open sources"><Menu /></button>
+          <span className="brand-name">Code Meeting Answerer</span>
+          <button className="icon-btn" onClick={() => setShowAI(true)} aria-label="AI settings"><Gear /></button>
+        </div>
+
+        <div className="main-inner">
+          {/* ---------- Command bar ---------- */}
+          <div className={`command ${hasSource ? "" : "disabled"} ${listening ? "is-live" : ""}`}>
+            <div className="command-row">
+              <Search size={20} className="command-ico" />
+              <textarea
+                ref={qRef}
+                rows={1}
+                value={question}
+                onChange={(e) => setQuestion(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); ask(); } }}
+                placeholder={hasSource ? "Ask anything about the code or docs…" : "Connect a repo or drop files to start"}
+                aria-label="Question"
+                disabled={!hasSource}
+              />
+              <button
+                className={`listen-btn ${listening ? "live" : ""}`}
+                onClick={() => (listening ? stopListening() : setListenSetup(true))}
+                disabled={!hasSource}
+                aria-label={listening ? "Stop listening" : "Listen to meeting"}
+                title={listening ? "Stop listening (L)" : "Listen to meeting (L)"}
+              >
+                {listening ? <><span className="live-dot" />{mmss}<Stop size={14} /></> : <><Mic size={18} /><span className="hide-sm">Listen</span></>}
+              </button>
+              <button className="answer-btn" onClick={() => ask()} disabled={!hasSource || !question.trim()}>
+                Answer <Arrow size={16} />
+              </button>
+            </div>
+            <div className="command-foot">
+              {suggestions.length > 0 && !results.length ? (
+                <div className="sugs">
+                  {suggestions.map((s) => (
+                    <button key={s} className="sug" onClick={() => ask(s)}>{s}</button>
                   ))}
                 </div>
-                <details className="token">
-                  <summary>Private repo or hitting rate limits? Add a GitHub token</summary>
-                  <div className="row">
-                    <input className="input mono" type="password" autoComplete="off" placeholder="github_pat_… (read-only, kept in memory only)" value={ghToken} onChange={(e) => setGhToken(e.target.value)} aria-label="GitHub token" />
-                  </div>
-                  <p className="hint">Fine-grained token with read-only “Contents” access. Branches and sub-folders work: github.com/owner/repo/tree/branch/path</p>
-                </details>
-              </div>
-            )}
+              ) : (
+                <span className="keys hide-sm"><kbd>Enter</kbd> answer <kbd>⌘K</kbd> focus <kbd>L</kbd> listen</span>
+              )}
+              <span className="mode-pill">{aiReady ? <><Sparkle size={13} /> AI</> : <><Bolt size={13} /> Instant · no AI</>}</span>
+            </div>
+          </div>
 
-            {tab === "upload" && (
-              <div
-                className={`drop ${over ? "over" : ""}`}
-                onDragOver={(e) => { e.preventDefault(); setOver(true); }}
-                onDragLeave={() => setOver(false)}
-                onDrop={async (e) => { e.preventDefault(); setOver(false); handleFiles(await filesFromDrop(e.dataTransfer)); }}
-              >
-                <p>
-                  <b>Drop folders, files or .zip archives here</b> — drop several at once, or add more later.
-                  <br />
-                  Code, PDF, Word, PowerPoint, Excel, CSV, Markdown, notebooks and more. Read in your browser, never uploaded.
-                </p>
-                <div className="row">
-                  <button className="btn primary" onClick={() => folderRef.current?.click()} disabled={!!progress}>Choose folder</button>
-                  <button className="btn" onClick={() => filesRef.current?.click()} disabled={!!progress}>Choose files, docs or .zip</button>
+          {/* ---------- Listen setup sheet ---------- */}
+          {listenSetup && !listening && (
+            <div className="sheet" role="dialog" aria-label="Start listening">
+              <div className="sheet-head">
+                <div>
+                  <h2>Listen to the meeting</h2>
+                  <p>Questions are transcribed live, shown on screen, and answered from your code.</p>
                 </div>
-                <p className="hint small">Dependencies and build output (node_modules, virtualenvs, site-packages, dist, hidden folders) are skipped automatically.</p>
-                <input ref={folderRef} type="file" multiple hidden onChange={(e) => handleFiles([...(e.target.files || [])])} />
-                <input ref={filesRef} type="file" multiple hidden accept={ACCEPT} onChange={(e) => handleFiles([...(e.target.files || [])])} />
+                <button className="icon-btn" onClick={() => setListenSetup(false)} aria-label="Close"><X /></button>
+              </div>
+              <div className="mode-grid" role="radiogroup">
+                {(["meeting", "both", "mic"] as ListenMode[]).filter((m) => meetingCapable || m === "mic").map((m) => (
+                  <button key={m} role="radio" aria-checked={mode === m} className={`mode-card ${mode === m ? "sel" : ""}`} onClick={() => setMode(m)}>
+                    <span className="mode-ico">{modeInfo[m].icon}</span>
+                    <span className="mode-title">{modeInfo[m].title}</span>
+                    <span className="mode-desc">{modeInfo[m].desc}</span>
+                  </button>
+                ))}
+              </div>
+              {mode !== "mic" && (
+                <div className="how">
+                  <span className="how-n">1</span> Pick the <b>Chrome Tab</b> with your call
+                  <span className="how-n">2</span> Turn on <b>Also share tab audio</b>
+                  <span className="how-n">3</span> Click <b>Share</b>
+                </div>
+              )}
+              {!stt && (
+                <div className="alert warn sm">
+                  {mode === "mic" ? "Using free browser speech. For best accuracy (and Brave / Arc), add an OpenAI or Groq key." : "Meeting audio needs an OpenAI or Groq key for transcription."}
+                  <button className="link" onClick={() => setShowAI(true)}>Add key</button>
+                </div>
+              )}
+              <div className="sheet-foot">
+                <label className="switch">
+                  <input type="checkbox" checked={autoAnswer} onChange={(e) => setAutoAnswer(e.target.checked)} />
+                  <span className="track"><i /></span>
+                  Auto-answer questions
+                </label>
+                <button className="btn primary lg" onClick={() => { setListenSetup(false); startListening(); }}>
+                  <Mic size={18} /> Start listening
+                </button>
+              </div>
+            </div>
+          )}
+
+          {notice && <div className="alert warn" role="status">{notice}<button className="icon-btn sm" onClick={() => setNotice("")} aria-label="Dismiss"><X size={13} /></button></div>}
+          {listenError && <div className="alert danger" role="alert">{listenError}<button className="icon-btn sm" onClick={() => setListenError("")} aria-label="Dismiss"><X size={13} /></button></div>}
+
+          {/* ---------- Live panel ---------- */}
+          {showLive && (
+            <section className={`live ${listening ? "on" : ""}`} aria-label="Live meeting">
+              <header className="live-head">
+                <div className="live-left">
+                  {listening ? <span className="live-badge"><span className="live-dot" />LIVE</span> : <span className="live-badge off">PAUSED</span>}
+                  <span className="live-engine">{listening ? engineLabel : "Listening stopped"}</span>
+                </div>
+                <div className="live-right">
+                  {listening && (
+                    <span className={`vu ${speaking ? "speaking" : ""}`} aria-hidden>
+                      {[0, 1, 2, 3, 4, 5, 6].map((i) => (
+                        <i key={i} style={{ transform: `scaleY(${0.2 + Math.min(1, level * (1.5 - Math.abs(3 - i) * 0.25) + (speaking ? 0.25 : 0)) * 0.8})` }} />
+                      ))}
+                    </span>
+                  )}
+                  <span className="live-state">{listening ? (pending > 0 ? "Transcribing…" : speaking ? "Hearing speech" : "Listening") : ""}</span>
+                  <label className="switch sm" title="Auto-answer detected questions">
+                    <input type="checkbox" checked={autoAnswer} onChange={(e) => setAutoAnswer(e.target.checked)} />
+                    <span className="track"><i /></span>
+                    <span className="hide-sm">Auto-answer</span>
+                  </label>
+                  {listening ? (
+                    <button className="btn danger sm" onClick={stopListening}><Stop size={12} /> Stop</button>
+                  ) : (
+                    <button className="btn sm" onClick={() => setListenSetup(true)}><Mic size={14} /> Resume</button>
+                  )}
+                </div>
+              </header>
+
+              <div className="live-body">
+                <div className="transcript" ref={transcriptBox} aria-live="polite">
+                  {segs.length === 0 && !interim && (
+                    <div className="t-empty">
+                      <span className="pulse-ring"><Mic size={18} /></span>
+                      <p>Waiting for speech…</p>
+                      <span>Words appear here as people talk. Questions get highlighted.</span>
+                    </div>
+                  )}
+                  {segs.slice(-40).map((s) => (
+                    <p key={s.id} className={`t-line ${s.q ? "q" : ""}`}>
+                      <time>{clock(s.at)}</time>
+                      <span>{s.text}</span>
+                    </p>
+                  ))}
+                  {interim && (
+                    <p className="t-line interim"><time>{clock(now)}</time><span>{interim}<i className="caret" /></span></p>
+                  )}
+                  {pending > 0 && !interim && <p className="t-line interim"><time>{clock(now)}</time><span className="dots"><i /><i /><i /></span></p>}
+                </div>
+
+                <div className="heard">
+                  {latestHeard ? (
+                    <div className="heard-card" key={latestHeard.id}>
+                      <div className="heard-top">
+                        <span className="heard-tag">Question heard</span>
+                        <span className="heard-time">{timeAgo(latestHeard.at, now)}</span>
+                      </div>
+                      <p className="heard-q">{latestHeard.q}</p>
+                      {latestResult ? (
+                        <>
+                          {latestResult.ai === "searching" || latestResult.ai === "writing" ? (
+                            <div className="thinking"><span className="spinner" />{latestResult.ai === "searching" ? "Searching your code…" : "Writing answer…"}</div>
+                          ) : null}
+                          <p className="heard-a">{renderInline(latestResult.answer.answer, () => scrollToResult(latestResult.id))}</p>
+                          <button className="btn ghost sm" onClick={() => scrollToResult(latestResult.id)}>Sources & code <Chevron size={14} /></button>
+                        </>
+                      ) : (
+                        <button className="btn primary" onClick={() => answerDetected(latestHeard)}>Answer this <Arrow size={15} /></button>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="heard-empty">
+                      <Sparkle size={18} />
+                      <p>Questions about the project will pop up here — with the answer.</p>
+                    </div>
+                  )}
+                  {detected.length > 1 && (
+                    <div className="earlier">
+                      {[...detected].reverse().slice(1, 5).map((d) => (
+                        <button key={d.id} className="earlier-item" onClick={() => (d.answered ? scrollToResult(d.resultId) : answerDetected(d))}>
+                          <span>{d.q}</span>
+                          {d.answered ? <Chevron size={14} /> : <span className="tiny-chip">Answer</span>}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            </section>
+          )}
+
+          {/* ---------- Empty / onboarding ---------- */}
+          {!hasSource && !progress && (
+            <section className="hero">
+              <span className="eyebrow"><span className="live-dot static" /> Built for live meetings</span>
+              <h1>Someone asks about the code.<br /><em>You answer in seconds.</em></h1>
+              <p className="lead">Connect a repo or drop your files. Ask, or let it listen to the call. Answers come from the actual code, with the exact file, lines and page.</p>
+              <div className="start-grid">
+                <button className="start-card" onClick={() => setGhOpen(true)}>
+                  <span className="start-ico"><Github size={22} /></span>
+                  <span className="start-title">Connect GitHub</span>
+                  <span className="start-desc">Any public repo in one click, private with a token.</span>
+                </button>
+                <button className="start-card" onClick={() => folderRef.current?.click()}>
+                  <span className="start-ico"><Folder size={22} /></span>
+                  <span className="start-title">Upload a folder</span>
+                  <span className="start-desc">Code, PDF, Word, slides, sheets. Read in your browser.</span>
+                </button>
+                <button className="start-card" onClick={loadDemo}>
+                  <span className="start-ico"><Sparkle size={22} /></span>
+                  <span className="start-title">Try the demo</span>
+                  <span className="start-desc">A sample SaaS codebase with ready-made questions.</span>
+                </button>
+              </div>
+              <ol className="flow">
+                <li><span>1</span>Connect code & docs</li>
+                <li><span>2</span>Ask or listen</li>
+                <li><span>3</span>Answer with exact sources</li>
+              </ol>
+            </section>
+          )}
+
+          {/* ---------- Answers feed ---------- */}
+          <div className="feed" aria-live="polite">
+            {results.map((r) => (
+              <AnswerCard key={r.id} r={r} multi={sources.length > 1} onFollow={(q) => { setQuestion(q); qRef.current?.focus(); }} />
+            ))}
+            {hasSource && !results.length && !showLive && (
+              <div className="feed-empty">
+                <div className="fe-ico"><Code size={20} /></div>
+                <p><b>Ready.</b> {totals.files.toLocaleString()} files · {totals.lines.toLocaleString()} lines indexed{totals.docs ? ` · ${totals.docs} documents` : ""}.</p>
+                <span>Type a question above, or press <kbd>L</kbd> to listen to the meeting.</span>
               </div>
             )}
+          </div>
+        </div>
+      </main>
 
-            {tab === "demo" && (
+      {/* ================= SETTINGS MODAL ================= */}
+      {showAI && (
+        <div className="modal-wrap" onMouseDown={(e) => e.target === e.currentTarget && setShowAI(false)}>
+          <div className="modal" role="dialog" aria-modal="true" aria-label="AI settings">
+            <div className="modal-head">
               <div>
-                <p className="hint" style={{ marginTop: 0 }}>Load a small sample SaaS codebase (payments, preferences, rate limiting) to see how answers look.</p>
-                <button className="btn primary" style={{ marginTop: 10 }} onClick={loadDemo}>Load sample codebase</button>
+                <h2>AI & transcription</h2>
+                <p>Optional. Without a key, answers come straight from matching code, instantly, and nothing leaves your browser.</p>
               </div>
-            )}
-          </div>
-        )}
+              <button className="icon-btn" onClick={() => setShowAI(false)} aria-label="Close"><X /></button>
+            </div>
+            <div className="modal-body">
+              <label className="lbl">AI provider</label>
+              <div className="seg">
+                {(Object.keys(PROVIDERS) as ProviderId[]).map((p) => (
+                  <button key={p} className={provider === p ? "sel" : ""} onClick={() => setProvider(p)}>{PROVIDERS[p].label}</button>
+                ))}
+              </div>
+              <label className="lbl" htmlFor="k">API key</label>
+              <input id="k" className="field" type="password" autoComplete="off" placeholder={server.server.includes(provider) ? "Using server key (optional override)" : `${PROVIDERS[provider].label} API key`} value={apiKey} onChange={(e) => setApiKey(e.target.value)} aria-label="API key" />
+              <label className="lbl" htmlFor="m">Model <span className="opt">optional</span></label>
+              <input id="m" className="field" placeholder={`Default: ${PROVIDERS[provider].model}`} value={model} onChange={(e) => setModel(e.target.value)} aria-label="Model" />
 
-        {progress && (
-          <div className="progress" role="status">
-            <div className="bar"><i style={{ width: `${progress.pct}%` }} /></div>
-            <p>{progress.msg}</p>
-          </div>
-        )}
-        {loadError && <div className="err" role="alert">{loadError}</div>}
-      </section>
-
-      {/* ---------- live listening ---------- */}
-      <section className={`card listen ${listening ? "live" : ""}`} aria-label="Live listening">
-        <div className="listen-row">
-          <div className="listen-title">
-            <span className={`rec ${listening ? "on" : ""}`} aria-hidden />
-            <div>
-              <p className="section-label" style={{ margin: 0 }}>2 · Listen to the meeting</p>
-              <span className="meta">
-                {listening ? engineLabel || "Listening" : "Hears questions from the call, shows them live, and answers them automatically"}
+              <div className="divider" />
+              <label className="lbl">Transcription for listening</label>
+              <p className="help">
+                {provider === "openai" || provider === "groq"
+                  ? "Uses the key above automatically. Add a different one below only if you want."
+                  : `${PROVIDERS[provider].label} can't transcribe audio. Add an OpenAI or Groq key here to listen to meetings.`}
+              </p>
+              <div className="seg">
+                <button className={sttProvider === "openai" ? "sel" : ""} onClick={() => setSttProvider("openai")}>OpenAI</button>
+                <button className={sttProvider === "groq" ? "sel" : ""} onClick={() => setSttProvider("groq")}>Groq Whisper</button>
+              </div>
+              <input className="field" type="password" autoComplete="off" placeholder="Transcription key (optional)" value={sttKey} onChange={(e) => setSttKey(e.target.value)} aria-label="Transcription key" />
+            </div>
+            <div className="modal-foot">
+              <span className="status-line">
+                <span className={`ai-dot ${aiReady ? "on" : ""}`} /> {aiReady ? "AI answers on" : "AI answers off"} · {stt ? "transcription ready" : "free browser speech only"}
               </span>
+              <span className="help"><Lock size={12} /> Keys stay in this tab&apos;s memory only.</span>
+              <button className="btn primary" onClick={() => setShowAI(false)}>Done</button>
             </div>
-          </div>
-          <div className="listen-ctl">
-            {!listening && (
-              <select value={mode} onChange={(e) => setMode(e.target.value as ListenMode)} aria-label="Audio source" className="select">
-                {meetingCapable && <option value="meeting">Meeting audio (tab / screen)</option>}
-                {meetingCapable && <option value="both">Meeting audio + my mic</option>}
-                <option value="mic">My microphone</option>
-              </select>
-            )}
-            <label className="toggle">
-              <input type="checkbox" checked={autoAnswer} onChange={(e) => setAutoAnswer(e.target.checked)} />
-              <span>Auto-answer</span>
-            </label>
-            {listening ? (
-              <button className="btn stop" onClick={stopListening}>Stop</button>
-            ) : (
-              <button className="btn primary" onClick={startListening} disabled={!hasSource} title={hasSource ? "" : "Add code or documents first"}>
-                Start listening
-              </button>
-            )}
           </div>
         </div>
-        {!listening && !listenError && !notice && hasSource && mode !== "mic" && (
-          <ol className="steps">
-            <li>Click <b>Start listening</b>.</li>
-            <li>In the share window, choose the <b>Chrome Tab</b> with your meeting (Meet / Teams / Zoom web).</li>
-            <li>Make sure <b>“Also share tab audio”</b> is switched on, then click <b>Share</b>.</li>
-            <li className="muted">Desktop app (Zoom / Teams)? Choose <b>Entire screen</b> + <b>“Share system audio”</b>. If your Mac doesn&apos;t offer audio, the app switches to your microphone automatically.</li>
-            {!stt && <li className="muted">Meeting audio needs an OpenAI or Groq key (AI settings). “My microphone” works free.</li>}
-          </ol>
-        )}
-        {notice && <div className="notice" role="status">{notice}</div>}
-        {listenError && <div className="err" role="alert">{listenError}</div>}
+      )}
 
-        {(listening || segs.length > 0) && (
-          <div className="live-wrap">
-            {latestHeard && (
-              <div className="heard-hero" aria-live="assertive">
-                <div className="heard-label">
-                  <span className="rec on small" aria-hidden />
-                  Question heard · {timeAgo(latestHeard.at, now)}
-                </div>
-                <p className="heard-q">“{latestHeard.q}”</p>
-                {latestResult ? (
-                  <div className="heard-ans">
-                    {latestResult.ai === "searching" || latestResult.ai === "writing" ? (
-                      <span className="ai-wait"><span className="spinner" />{latestResult.ai === "searching" ? "Searching your code…" : "Writing answer…"}</span>
-                    ) : null}
-                    <p>{renderInline(latestResult.answer.answer, () => scrollToResult(latestResult.id))}</p>
-                    <button className="btn sm" onClick={() => scrollToResult(latestResult.id)}>View sources &amp; code ↓</button>
-                  </div>
-                ) : (
-                  <div className="heard-ans">
-                    <button className="btn primary" onClick={() => answerDetected(latestHeard)}>Answer this</button>
-                    <span className="meta" style={{ marginLeft: 10 }}>Auto-answer is off — it&apos;s also in the question box below.</span>
-                  </div>
-                )}
-              </div>
-            )}
-
-            <div className="transcript-head">
-              <span className="section-label" style={{ margin: 0 }}>Live transcript</span>
-              {listening && (
-                <span className={`live-status ${speaking ? "speaking" : ""}`}>
-                  <span className="bars" aria-hidden>
-                    {[0, 1, 2, 3, 4].map((i) => (
-                      <i key={i} style={{ height: `${4 + Math.round(Math.min(1, level * (1.4 - i * 0.12) + (speaking ? 0.15 : 0)) * 14)}px` }} />
-                    ))}
-                  </span>
-                  {pending > 0 ? "Transcribing…" : speaking ? "Hearing speech…" : "Listening…"}
-                </span>
-              )}
-            </div>
-            <div className="transcript big" ref={transcriptBox} aria-live="polite">
-              {segs.length === 0 && !interim && (
-                <p className="placeholder">
-                  {listening ? "Waiting for speech — words will appear here as people talk. Questions are highlighted." : "Transcript cleared."}
-                </p>
-              )}
-              {segs.slice(-30).map((s) => (
-                <p key={s.id} className={s.q ? "is-q" : ""}>
-                  <span className="ts">{clock(s.at)}</span>
-                  {s.text}
-                </p>
-              ))}
-              {interim && (
-                <p className="interim">
-                  <span className="ts">{clock(now)}</span>
-                  {interim}
-                  <span className="caret" />
-                </p>
-              )}
-              {pending > 0 && !interim && <p className="interim"><span className="ts">{clock(now)}</span><span className="dots"><i /><i /><i /></span></p>}
-            </div>
+      {/* ================= DROP OVERLAY ================= */}
+      {dragging && (
+        <div className="drop-overlay" aria-hidden>
+          <div className="drop-box">
+            <Folder size={34} />
+            <h3>Drop to add</h3>
+            <p>Folders, code, PDFs, Word, slides, sheets or .zip</p>
           </div>
-        )}
-
-        {detected.length > 1 && (
-          <div className="detected">
-            <p className="section-label">Earlier questions</p>
-            {[...detected].reverse().slice(1, 7).map((d) => (
-              <div key={d.id} className="dq">
-                <span>{d.q}</span>
-                {d.answered ? (
-                  <button className="btn sm ghost" onClick={() => scrollToResult(d.resultId)}>View answer ↓</button>
-                ) : (
-                  <button className="btn sm primary" onClick={() => answerDetected(d)}>Answer</button>
-                )}
-              </div>
-            ))}
-          </div>
-        )}
-      </section>
-
-      {/* ---------- ask ---------- */}
-      <section className="card ask" aria-label="Ask a question">
-        <p className="section-label">3 · Or type the question</p>
-        <textarea
-          ref={qRef}
-          value={question}
-          onChange={(e) => setQuestion(e.target.value)}
-          onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); ask(); } }}
-          placeholder={hasSource ? "e.g. How does the payment retry logic work?" : "Add code or documents first"}
-          aria-label="Question"
-          disabled={!hasSource}
-        />
-        {suggestions.length > 0 && (
-          <div className="chips">
-            {suggestions.map((s) => (
-              <button key={s} className="chip" onClick={() => ask(s)}>{s}</button>
-            ))}
-          </div>
-        )}
-        <div className="ask-actions">
-          <span className="kbd"><kbd>Enter</kbd> to answer · <kbd>Shift</kbd>+<kbd>Enter</kbd> for a new line</span>
-          <button className="btn primary answer-btn" onClick={() => ask()} disabled={!hasSource || !question.trim()}>Answer</button>
         </div>
-      </section>
-
-      <div className="results" aria-live="polite">
-        {results.map((r) => (
-          <AnswerCard key={r.id} r={r} multi={sources.length > 1} />
-        ))}
-        {hasSource && !results.length && (
-          <div className="empty">Answers appear here with the exact files, lines and pages they came from. Ask as many questions as you like.</div>
-        )}
-      </div>
-
-      <p className="foot">No login · no database · nothing persists after you close this tab.</p>
+      )}
     </div>
   );
 }
@@ -795,7 +989,7 @@ function renderInline(text: string, onCite: (n: number) => void) {
     const m = p.match(/^\[(\d+(?:\s*,\s*\d+)*)\]$/);
     if (m)
       return (
-        <span key={i}>
+        <span key={i} className="cites">
           {m[1].split(/\s*,\s*/).map((n) => (
             <a key={n} href="#" className="cite" onClick={(e) => { e.preventDefault(); onCite(Number(n)); }} aria-label={`Source ${n}`}>{n}</a>
           ))}
@@ -805,95 +999,119 @@ function renderInline(text: string, onCite: (n: number) => void) {
   });
 }
 
-function AnswerCard({ r, multi }: { r: Result; multi: boolean }) {
+function AnswerCard({ r, multi, onFollow }: { r: Result; multi: boolean; onFollow: (q: string) => void }) {
   const refs = useRef<Record<number, HTMLDivElement | null>>({});
+  const [open, setOpen] = useState<Record<number, boolean>>({});
   const [showOther, setShowOther] = useState(false);
+  const [copied, setCopied] = useState(false);
   const termSet = useMemo(() => new Set(expandQuery(r.question).filter((t) => t.original).map((t) => t.term)), [r.question]);
   const a = r.answer;
   const numbered = r.hits.map((h, i) => ({ h, n: i + 1 }));
-  const cited = a.mode === "ai" && a.cited?.length ? numbered.filter((x) => a.cited!.includes(x.n)) : a.mode === "ai" ? numbered.slice(0, 3) : numbered;
+  const cited = a.mode === "ai" && a.cited?.length ? numbered.filter((x) => a.cited!.includes(x.n)) : a.mode === "ai" ? numbered.slice(0, 3) : numbered.slice(0, 4);
   const other = numbered.filter((x) => !cited.includes(x));
+  const firstN = cited[0]?.n;
+  const isOpen = (n: number) => (open[n] ?? n === firstN);
+  const loading = r.ai === "searching" || r.ai === "writing";
+
   const cite = (n: number) => {
     if (!cited.some((x) => x.n === n)) setShowOther(true);
+    setOpen((o) => ({ ...o, [n]: true }));
     setTimeout(() => {
       const el = refs.current[n];
       if (el) {
         el.scrollIntoView({ behavior: "smooth", block: "center" });
-        el.animate([{ outline: "2px solid var(--accent)" }, { outline: "2px solid transparent" }], { duration: 1200 });
+        el.animate([{ boxShadow: "0 0 0 2px var(--accent)" }, { boxShadow: "0 0 0 2px transparent" }], { duration: 1400 });
       }
-    }, 30);
+    }, 40);
   };
   const copyAll = () => {
     const txt = `Q: ${r.question}\n\n${a.answer}\n\n${a.keyPoints.map((k) => "- " + k).join("\n")}\n\nSources:\n${cited.map(({ h, n }) => `[${n}] ${h.path}${h.loc ? ` (${h.loc})` : ""}:${h.start}-${h.end}`).join("\n")}`;
     navigator.clipboard?.writeText(txt.replace(/`/g, ""));
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1500);
   };
+
   const renderSrc = ({ h, n }: { h: Hit; n: number }) => (
-    <div className="src" key={n} ref={(el) => { refs.current[n] = el; }}>
-      <div className="src-head">
-        <span className="src-path">
-          <span className="cite">{n}</span>
-          <span>
-            {multi && h.src ? <span className="lines">{h.src} › </span> : null}
-            {h.path}
-            <span className="lines">{h.loc ? ` · ${h.loc}` : ""}{h.doc ? "" : `:${h.start}–${h.end}`}</span>
-          </span>
+    <div className={`source ${isOpen(n) ? "open" : ""}`} key={n} ref={(el) => { refs.current[n] = el; }}>
+      <button className="source-row" onClick={() => setOpen((o) => ({ ...o, [n]: !isOpen(n) }))} aria-expanded={isOpen(n)}>
+        <span className="cite static">{n}</span>
+        <span className="source-ico">{h.doc ? <FileIcon size={15} /> : <Code size={15} />}</span>
+        <span className="source-path">
+          {multi && h.src ? <span className="dim">{h.src} › </span> : null}
+          {h.path.includes("/") ? <span className="dim">{h.path.slice(0, h.path.lastIndexOf("/") + 1)}</span> : null}
+          <b>{h.path.split("/").pop()}</b>
         </span>
-        <span className="src-actions">
-          <button className="btn ghost sm" onClick={() => navigator.clipboard?.writeText(`${h.path}${h.loc ? ` (${h.loc})` : ""}:${h.start}-${h.end}`)} title="Copy file path and lines">Copy path</button>
-          {h.origin && !h.doc && (
-            <a className="btn ghost sm" target="_blank" rel="noreferrer" href={`https://github.com/${h.origin.owner}/${h.origin.repo}/blob/${h.origin.sha}/${h.path}#L${h.start}-L${h.end}`}>GitHub ↗</a>
-          )}
-        </span>
-      </div>
-      <pre className={`code ${h.doc ? "doc" : ""}`}>
-        {h.code.split("\n").map((l, j) => {
-          const hit = tokenize(l).some((t) => termSet.has(t));
-          return (
-            <div key={j} className={`ln ${hit ? "hit" : ""}`}>
-              <span>{h.start + j}</span>
-              <span>{l || " "}</span>
-            </div>
-          );
-        })}
-      </pre>
+        <span className="source-loc">{h.loc ? h.loc : `L${h.start}–${h.end}`}</span>
+        <Chevron size={15} className="chev" />
+      </button>
+      {isOpen(n) && (
+        <div className="source-code">
+          <div className="code-actions">
+            <button className="btn ghost xs" onClick={() => navigator.clipboard?.writeText(`${h.path}${h.loc ? ` (${h.loc})` : ""}:${h.start}-${h.end}`)}><Copy size={12} /> Path</button>
+            <button className="btn ghost xs" onClick={() => navigator.clipboard?.writeText(h.code)}><Copy size={12} /> Code</button>
+            {h.origin && !h.doc && (
+              <a className="btn ghost xs" target="_blank" rel="noreferrer" href={`https://github.com/${h.origin.owner}/${h.origin.repo}/blob/${h.origin.sha}/${h.path}#L${h.start}-L${h.end}`}><External size={12} /> GitHub</a>
+            )}
+          </div>
+          <pre className={`code ${h.doc ? "doc" : ""}`}>
+            {h.code.split("\n").map((l, j) => {
+              const hit = tokenize(l).some((t) => termSet.has(t));
+              return (
+                <div key={j} className={`ln ${hit ? "hit" : ""}`}>
+                  <span>{h.start + j}</span>
+                  <span>{l || " "}</span>
+                </div>
+              );
+            })}
+          </pre>
+        </div>
+      )}
     </div>
   );
+
   return (
-    <article className="card ans" id={`r-${r.id}`}>
-      <div className="ans-q">
-        <b>{r.question}</b>
-        <button className="btn ghost sm" onClick={copyAll} title="Copy answer and sources">Copy</button>
-      </div>
-      <div className="badges">
-        {r.heard && <span className="badge heard">Heard in meeting</span>}
-        {a.mode === "ai" ? <span className="badge ai">AI answer · {a.model}</span> : <span className="badge">From the code · no AI</span>}
-        <span className={`badge ${a.confidence}`}>Match: {a.confidence}</span>
-        <span className="badge">{r.ms} ms search</span>
-        {(r.ai === "searching" || r.ai === "writing") && (
-          <span className="ai-wait"><span className="spinner" />{r.ai === "searching" ? "Searching deeper…" : "Writing answer…"}</span>
-        )}
-        {r.ai === "error" && <span className="badge Low" title={r.aiError}>AI failed: {r.aiError?.slice(0, 90)}</span>}
-      </div>
-      <p className="ans-text">{renderInline(a.answer, cite)}</p>
-      {a.keyPoints.length > 0 && (
-        <>
-          <p className="section-label">Key points</p>
-          <ul className="kp">
-            {a.keyPoints.map((k, i) => (
-              <li key={i}>{renderInline(k, cite)}</li>
-            ))}
-          </ul>
-        </>
+    <article className="answer" id={`r-${r.id}`}>
+      <header className="answer-head">
+        <div className="answer-tags">
+          {r.heard ? <span className="tag heard"><Mic size={12} /> Heard in meeting</span> : <span className="tag">Asked</span>}
+          {a.mode === "ai" ? <span className="tag ai"><Sparkle size={12} /> {a.model}</span> : <span className="tag"><Bolt size={12} /> From the code</span>}
+          <span className={`tag conf ${a.confidence}`}><i />{a.confidence} match</span>
+          <span className="tag dim">{r.ms} ms</span>
+        </div>
+        <div className="answer-actions">
+          <button className="icon-btn sm" onClick={() => onFollow(`${r.question} — follow-up: `)} title="Ask a follow-up" aria-label="Ask a follow-up"><Reply size={15} /></button>
+          <button className="icon-btn sm" onClick={copyAll} title="Copy answer & sources" aria-label="Copy answer">{copied ? <Check size={15} /> : <Copy size={15} />}</button>
+        </div>
+      </header>
+      <h3 className="answer-q">{r.question}</h3>
+
+      {loading && a.mode !== "ai" && (
+        <div className="thinking"><span className="spinner" />{r.ai === "searching" ? "Searching deeper…" : "Writing a clear answer…"}<span className="shimmer" /></div>
       )}
-      {cited.length > 0 && <p className="section-label">Sources</p>}
-      {cited.map(renderSrc)}
-      {other.length > 0 && (
-        <>
-          <button className="btn ghost sm more" onClick={() => setShowOther((s) => !s)}>
-            {showOther ? "Hide" : "Show"} {other.length} other match{other.length > 1 ? "es" : ""}
-          </button>
-          {showOther && other.map(renderSrc)}
-        </>
+      <p className={`answer-text ${loading && a.mode !== "ai" ? "pending" : ""}`}>{renderInline(a.answer, cite)}</p>
+      {r.ai === "error" && <div className="alert danger sm">AI couldn&apos;t answer: {r.aiError?.slice(0, 160)}. Showing the instant answer from the code.</div>}
+
+      {a.keyPoints.length > 0 && (
+        <ul className="points">
+          {a.keyPoints.map((k, i) => (
+            <li key={i}>{renderInline(k, cite)}</li>
+          ))}
+        </ul>
+      )}
+
+      {cited.length > 0 && (
+        <div className="sources">
+          <div className="sources-label">Sources</div>
+          {cited.map(renderSrc)}
+          {other.length > 0 && (
+            <>
+              <button className="more-btn" onClick={() => setShowOther((s) => !s)}>
+                {showOther ? "Hide" : "Show"} {other.length} more match{other.length > 1 ? "es" : ""} <Chevron size={13} style={{ transform: showOther ? "rotate(180deg)" : "none" }} />
+              </button>
+              {showOther && other.map(renderSrc)}
+            </>
+          )}
+        </div>
       )}
     </article>
   );
