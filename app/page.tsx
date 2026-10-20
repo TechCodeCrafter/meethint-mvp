@@ -6,7 +6,7 @@ import { extractiveAnswer, type Answer } from "@/lib/answer";
 import { loadGitHub, loadUploaded, filesFromDrop } from "@/lib/loaders";
 import { DEMO_FILES } from "@/lib/demo";
 import { PROVIDERS, type ProviderId } from "@/lib/providers";
-import { Listener, BrowserSpeech, canCaptureMeetingAudio, hasBrowserSpeech, heuristicQuestions, type ListenMode } from "@/lib/listen";
+import { Listener, BrowserSpeech, NoAudioError, canCaptureMeetingAudio, hasBrowserSpeech, heuristicQuestions, type ListenMode } from "@/lib/listen";
 
 type Source = {
   id: number;
@@ -31,8 +31,8 @@ type Result = {
   heard?: boolean;
 };
 
-type Seg = { id: number; text: string; at: number };
-type Detected = { id: number; q: string; answered: boolean };
+type Seg = { id: number; text: string; at: number; q?: boolean };
+type Detected = { id: number; q: string; answered: boolean; at: number; resultId?: number };
 
 const EXAMPLE_REPOS = ["sindresorhus/ky", "expressjs/express", "vercel/swr", "supabase/supabase-js"];
 const DEMO_QUESTIONS = [
@@ -90,6 +90,10 @@ export default function Page() {
   const [level, setLevel] = useState(0);
   const [segs, setSegs] = useState<Seg[]>([]);
   const [interim, setInterim] = useState("");
+  const [speaking, setSpeaking] = useState(false);
+  const [pending, setPending] = useState(0);
+  const [notice, setNotice] = useState("");
+  const [engineLabel, setEngineLabel] = useState("");
   const [detected, setDetected] = useState<Detected[]>([]);
   const [autoAnswer, setAutoAnswer] = useState(true);
   const [listenError, setListenError] = useState("");
@@ -100,6 +104,12 @@ export default function Page() {
   const autoRef = useRef(autoAnswer);
   autoRef.current = autoAnswer;
   const transcriptBox = useRef<HTMLDivElement>(null);
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!listening && !detected.length) return;
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, [listening, detected.length]);
 
   useEffect(() => {
     fetch("/api/config")
@@ -212,8 +222,6 @@ export default function Page() {
     const id = nextId.current++;
     const useAI = aiReady;
     setResults((r) => [{ id, question: q, hits: hits.slice(0, 6), answer, ms, ai: useAI ? "searching" : "off", heard: opts.heard }, ...r]);
-    if (opts.heard && document.activeElement !== qRef.current)
-      setTimeout(() => document.querySelector(".results")?.scrollIntoView({ behavior: "smooth", block: "start" }), 60);
     if (!opts.heard) setQuestion("");
     if (!useAI) return;
 
@@ -272,9 +280,9 @@ export default function Page() {
 
   // ---------- listening ----------
   async function onHeard(text: string) {
-    const seg = { id: Date.now() + Math.random(), text, at: Date.now() };
+    const seg: Seg = { id: Date.now() + Math.random(), text, at: Date.now(), q: /\?/.test(text) };
     const earlier = segsRef.current.slice(-8).map((s) => s.text).join(" ");
-    segsRef.current = [...segsRef.current, seg].slice(-60);
+    segsRef.current = [...segsRef.current, seg].slice(-80);
     setSegs(segsRef.current);
     let qs: string[] = [];
     if (aiReady) {
@@ -284,20 +292,27 @@ export default function Page() {
           headers: { "content-type": "application/json" },
           body: JSON.stringify({ task: "detect", earlier, latest: text, already: detectedRef.current.slice(-8).map((d) => d.q), ...aiBody() }),
         }).then((r) => r.json());
-        qs = j.questions || [];
+        qs = j.questions || heuristicQuestions(text);
       } catch {
         qs = heuristicQuestions(text);
       }
     } else qs = heuristicQuestions(text);
+    if (qs.length) {
+      segsRef.current = segsRef.current.map((x) => (x.id === seg.id ? { ...x, q: true } : x));
+      setSegs(segsRef.current);
+    }
     for (let q of qs) {
       if (detectedRef.current.some((d) => similar(d.q, q))) continue;
       q = q.charAt(0).toUpperCase() + q.slice(1);
-      const d: Detected = { id: Date.now() + Math.random(), q, answered: false };
-      detectedRef.current = [...detectedRef.current, d].slice(-20);
+      const d: Detected = { id: Date.now() + Math.random(), q, answered: false, at: Date.now() };
       if (autoRef.current && indexRef.current) {
         d.answered = true;
+        d.resultId = nextId.current;
         askRef.current(q, { heard: true, context: earlier + " " + text });
+      } else {
+        setQuestion(q);
       }
+      detectedRef.current = [...detectedRef.current, d].slice(-20);
       setDetected([...detectedRef.current]);
     }
   }
@@ -316,50 +331,75 @@ export default function Page() {
     return `Software project meeting. Terms: ${[...names].join(", ")}.`;
   }
 
+  async function startEngine(m: ListenMode) {
+    // Microphone: prefer the browser's live speech recognition (words appear as they're spoken).
+    if (m === "mic" && (hasBrowserSpeech() || !stt)) {
+      const b = new BrowserSpeech({
+        onText: (t) => {
+          setInterim("");
+          onHeardRef.current(t);
+        },
+        onInterim: (t) => {
+          setInterim(t);
+          setSpeaking(!!t);
+        },
+        onError: setListenError,
+        onEnd: () => setListening(false),
+      });
+      b.start();
+      listenerRef.current = b;
+      setEngineLabel("Live browser speech recognition (microphone)");
+      return;
+    }
+    if (!stt) throw new Error("Listening to meeting audio needs a transcription key (OpenAI or Groq) — open AI settings. Or switch to “My microphone” to use free live browser speech recognition.");
+    const prompt = vocabPrompt();
+    const l = new Listener({
+      mode: m,
+      transcribe: async (blob) => {
+        const fd = new FormData();
+        fd.append("file", blob, "seg.webm");
+        fd.append("provider", stt.provider);
+        if (stt.key) fd.append("apiKey", stt.key);
+        fd.append("prompt", prompt);
+        const r = await fetch("/api/transcribe", { method: "POST", body: fd });
+        const j = await r.json();
+        if (!r.ok) throw new Error(j.error || "Transcription failed");
+        return j.text || "";
+      },
+      onText: (t) => onHeardRef.current(t),
+      onLevel: setLevel,
+      onStatus: (st) => {
+        setSpeaking(st.speaking);
+        setPending(st.pending);
+      },
+      onError: (msg) => setListenError(msg),
+      onEnd: () => {
+        setListening(false);
+        setLevel(0);
+      },
+    });
+    await l.start();
+    listenerRef.current = l;
+    setEngineLabel(`${m === "mic" ? "Microphone" : m === "both" ? "Meeting audio + mic" : "Meeting audio"} · ${stt.provider === "groq" ? "Groq Whisper" : "OpenAI"} transcription`);
+  }
+
   async function startListening() {
     setListenError("");
+    setNotice("");
     setShowAI(false);
     try {
-      if (stt) {
-        const prompt = vocabPrompt();
-        const l = new Listener({
-          mode,
-          transcribe: async (blob) => {
-            const fd = new FormData();
-            fd.append("file", blob, "seg.webm");
-            fd.append("provider", stt.provider);
-            if (stt.key) fd.append("apiKey", stt.key);
-            fd.append("prompt", prompt);
-            const r = await fetch("/api/transcribe", { method: "POST", body: fd });
-            const j = await r.json();
-            if (!r.ok) throw new Error(j.error || "Transcription failed");
-            return j.text || "";
-          },
-          onText: (t) => onHeardRef.current(t),
-          onLevel: setLevel,
-          onError: (m) => setListenError(m),
-          onEnd: () => {
-            setListening(false);
-            setLevel(0);
-          },
-        });
-        await l.start();
-        listenerRef.current = l;
-      } else {
-        if (mode !== "mic") throw new Error("Listening to meeting audio needs a transcription key (OpenAI or Groq) — open AI settings. Or switch to “My microphone” to use free browser speech recognition.");
-        const b = new BrowserSpeech({
-          onText: (t) => {
-            setInterim("");
-            onHeardRef.current(t);
-          },
-          onInterim: setInterim,
-          onError: setListenError,
-          onEnd: () => setListening(false),
-        });
-        b.start();
-        listenerRef.current = b;
+      try {
+        await startEngine(mode);
+      } catch (e) {
+        if (!(e instanceof NoAudioError)) throw e;
+        // Common on macOS when sharing a window/screen: fall back to the microphone.
+        setNotice(
+          "That share had no audio (common on Mac when sharing a window or the whole screen), so I switched to your microphone — it hears the meeting through your speakers (don't use headphones). For the cleanest audio, share the meeting's Chrome tab with “Also share tab audio” on."
+        );
+        await startEngine("mic");
       }
       setListening(true);
+      setTimeout(() => document.querySelector(".listen")?.scrollIntoView({ behavior: "smooth", block: "start" }), 50);
     } catch (e: any) {
       setListenError(e.message || String(e));
       setListening(false);
@@ -372,12 +412,20 @@ export default function Page() {
     setListening(false);
     setInterim("");
     setLevel(0);
+    setSpeaking(false);
+    setPending(0);
   }
 
   function answerDetected(d: Detected) {
-    detectedRef.current = detectedRef.current.map((x) => (x.id === d.id ? { ...x, answered: true } : x));
+    const rid = nextId.current;
+    detectedRef.current = detectedRef.current.map((x) => (x.id === d.id ? { ...x, answered: true, resultId: rid } : x));
     setDetected(detectedRef.current);
     ask(d.q, { heard: true, context: segsRef.current.slice(-8).map((s) => s.text).join(" ") });
+  }
+
+  function scrollToResult(id?: number) {
+    if (!id) return;
+    document.getElementById(`r-${id}`)?.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
   const totals = useMemo(
@@ -389,6 +437,8 @@ export default function Page() {
     [sources]
   );
   const hasSource = sources.length > 0;
+  const latestHeard = detected.length ? detected[detected.length - 1] : null;
+  const latestResult = latestHeard?.resultId ? results.find((r) => r.id === latestHeard.resultId) : undefined;
   const suggestions = sources.some((s) => s.kind === "demo") ? DEMO_QUESTIONS : [];
   const engine = stt ? `${stt.provider === "groq" ? "Groq Whisper" : "OpenAI"} transcription` : hasBrowserSpeech() ? "free browser speech (mic only)" : "no speech engine";
 
@@ -557,7 +607,7 @@ export default function Page() {
             <div>
               <p className="section-label" style={{ margin: 0 }}>2 · Listen to the meeting</p>
               <span className="meta">
-                {listening ? `Listening · ${engine}` : "Hears questions from the call and answers them automatically"}
+                {listening ? engineLabel || "Listening" : "Hears questions from the call, shows them live, and answers them automatically"}
               </span>
             </div>
           </div>
@@ -582,31 +632,92 @@ export default function Page() {
             )}
           </div>
         </div>
-        {listening && (
-          <div className="meter" aria-hidden><i style={{ width: `${Math.round(level * 100)}%` }} /></div>
+        {!listening && !listenError && !notice && hasSource && mode !== "mic" && (
+          <ol className="steps">
+            <li>Click <b>Start listening</b>.</li>
+            <li>In the share window, choose the <b>Chrome Tab</b> with your meeting (Meet / Teams / Zoom web).</li>
+            <li>Make sure <b>“Also share tab audio”</b> is switched on, then click <b>Share</b>.</li>
+            <li className="muted">Desktop app (Zoom / Teams)? Choose <b>Entire screen</b> + <b>“Share system audio”</b>. If your Mac doesn&apos;t offer audio, the app switches to your microphone automatically.</li>
+            {!stt && <li className="muted">Meeting audio needs an OpenAI or Groq key (AI settings). “My microphone” works free.</li>}
+          </ol>
         )}
-        {!listening && !listenError && hasSource && mode !== "mic" && (
-          <p className="hint small">
-            In the share dialog, pick the meeting tab (Meet / Teams / Zoom web) and turn on <b>“Also share tab audio”</b> — or pick <b>Entire screen</b> with <b>“Share system audio”</b> for desktop apps.
-            {!stt && " Needs an OpenAI or Groq key in AI settings for transcription."}
-          </p>
-        )}
+        {notice && <div className="notice" role="status">{notice}</div>}
         {listenError && <div className="err" role="alert">{listenError}</div>}
-        {(segs.length > 0 || interim) && (
-          <div className="transcript" ref={transcriptBox} aria-live="off">
-            {segs.slice(-12).map((s) => (
-              <p key={s.id}>{s.text}</p>
-            ))}
-            {interim && <p className="interim">{interim}</p>}
+
+        {(listening || segs.length > 0) && (
+          <div className="live-wrap">
+            {latestHeard && (
+              <div className="heard-hero" aria-live="assertive">
+                <div className="heard-label">
+                  <span className="rec on small" aria-hidden />
+                  Question heard · {timeAgo(latestHeard.at, now)}
+                </div>
+                <p className="heard-q">“{latestHeard.q}”</p>
+                {latestResult ? (
+                  <div className="heard-ans">
+                    {latestResult.ai === "searching" || latestResult.ai === "writing" ? (
+                      <span className="ai-wait"><span className="spinner" />{latestResult.ai === "searching" ? "Searching your code…" : "Writing answer…"}</span>
+                    ) : null}
+                    <p>{renderInline(latestResult.answer.answer, () => scrollToResult(latestResult.id))}</p>
+                    <button className="btn sm" onClick={() => scrollToResult(latestResult.id)}>View sources &amp; code ↓</button>
+                  </div>
+                ) : (
+                  <div className="heard-ans">
+                    <button className="btn primary" onClick={() => answerDetected(latestHeard)}>Answer this</button>
+                    <span className="meta" style={{ marginLeft: 10 }}>Auto-answer is off — it&apos;s also in the question box below.</span>
+                  </div>
+                )}
+              </div>
+            )}
+
+            <div className="transcript-head">
+              <span className="section-label" style={{ margin: 0 }}>Live transcript</span>
+              {listening && (
+                <span className={`live-status ${speaking ? "speaking" : ""}`}>
+                  <span className="bars" aria-hidden>
+                    {[0, 1, 2, 3, 4].map((i) => (
+                      <i key={i} style={{ height: `${4 + Math.round(Math.min(1, level * (1.4 - i * 0.12) + (speaking ? 0.15 : 0)) * 14)}px` }} />
+                    ))}
+                  </span>
+                  {pending > 0 ? "Transcribing…" : speaking ? "Hearing speech…" : "Listening…"}
+                </span>
+              )}
+            </div>
+            <div className="transcript big" ref={transcriptBox} aria-live="polite">
+              {segs.length === 0 && !interim && (
+                <p className="placeholder">
+                  {listening ? "Waiting for speech — words will appear here as people talk. Questions are highlighted." : "Transcript cleared."}
+                </p>
+              )}
+              {segs.slice(-30).map((s) => (
+                <p key={s.id} className={s.q ? "is-q" : ""}>
+                  <span className="ts">{clock(s.at)}</span>
+                  {s.text}
+                </p>
+              ))}
+              {interim && (
+                <p className="interim">
+                  <span className="ts">{clock(now)}</span>
+                  {interim}
+                  <span className="caret" />
+                </p>
+              )}
+              {pending > 0 && !interim && <p className="interim"><span className="ts">{clock(now)}</span><span className="dots"><i /><i /><i /></span></p>}
+            </div>
           </div>
         )}
-        {detected.length > 0 && (
+
+        {detected.length > 1 && (
           <div className="detected">
-            <p className="section-label">Questions heard</p>
-            {[...detected].reverse().slice(0, 6).map((d) => (
+            <p className="section-label">Earlier questions</p>
+            {[...detected].reverse().slice(1, 7).map((d) => (
               <div key={d.id} className="dq">
                 <span>{d.q}</span>
-                {d.answered ? <span className="badge">Answered</span> : <button className="btn sm primary" onClick={() => answerDetected(d)}>Answer</button>}
+                {d.answered ? (
+                  <button className="btn sm ghost" onClick={() => scrollToResult(d.resultId)}>View answer ↓</button>
+                ) : (
+                  <button className="btn sm primary" onClick={() => answerDetected(d)}>Answer</button>
+                )}
               </div>
             ))}
           </div>
@@ -650,6 +761,14 @@ export default function Page() {
       <p className="foot">No login · no database · nothing persists after you close this tab.</p>
     </div>
   );
+}
+
+function clock(t: number) {
+  return new Date(t).toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" });
+}
+function timeAgo(t: number, now: number) {
+  const s = Math.max(0, Math.round((now - t) / 1000));
+  return s < 5 ? "just now" : s < 60 ? `${s}s ago` : `${Math.round(s / 60)} min ago`;
 }
 
 function renderInline(text: string, onCite: (n: number) => void) {
@@ -723,7 +842,7 @@ function AnswerCard({ r, multi }: { r: Result; multi: boolean }) {
     </div>
   );
   return (
-    <article className="card ans">
+    <article className="card ans" id={`r-${r.id}`}>
       <div className="ans-q">
         <b>{r.question}</b>
         <button className="btn ghost sm" onClick={copyAll} title="Copy answer and sources">Copy</button>

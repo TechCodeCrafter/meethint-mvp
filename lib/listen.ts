@@ -12,13 +12,16 @@ export type ListenerOpts = {
   transcribe: (blob: Blob) => Promise<string>;
   onText: (text: string) => void;
   onLevel?: (level: number) => void;
+  onStatus?: (s: { speaking: boolean; pending: number }) => void;
   onError: (msg: string) => void;
   onEnd: () => void;
 };
 
-const MIN_SEG = 3500;
-const MAX_SEG = 14000;
-const QUIET_MS = 700;
+const MIN_SEG = 2500;
+const MAX_SEG = 10000;
+const QUIET_MS = 600;
+
+export class NoAudioError extends Error {}
 
 // Phrases speech models commonly hallucinate on silence/noise.
 const HALLUCINATIONS = /^(thank you\.?|thanks for watching!?|you|bye\.?|\.|subtitles by.*|amara\.org.*|please subscribe.*|okay\.?)$/i;
@@ -47,6 +50,11 @@ export class Listener {
   private lastLoud = 0;
   private hadSpeech = false;
   private queue: Promise<void> = Promise.resolve();
+  private pending = 0;
+  private speaking = false;
+  private status() {
+    this.o.onStatus?.({ speaking: this.speaking, pending: this.pending });
+  }
 
   constructor(private o: ListenerOpts) {}
 
@@ -67,7 +75,7 @@ export class Listener {
         this.streams.push(display);
         if (!display.getAudioTracks().length) {
           this.cleanup();
-          throw new Error(
+          throw new NoAudioError(
             "No audio was shared. Choose the meeting tab (Google Meet, Teams or Zoom web) and turn on “Also share tab audio”, or choose “Entire screen” and turn on “Also share system audio” (Windows / ChromeOS / recent macOS)."
           );
         }
@@ -113,6 +121,11 @@ export class Listener {
         this.lastLoud = now;
         this.hadSpeech = true;
       }
+      const sp = now - this.lastLoud < 500;
+      if (sp !== this.speaking) {
+        this.speaking = sp;
+        this.status();
+      }
       const el = now - this.segStart;
       if (this.rec?.state === "recording" && ((el > MIN_SEG && now - this.lastLoud > QUIET_MS && this.hadSpeech) || el > MAX_SEG)) {
         this.rec.stop(); // triggers next segment
@@ -134,14 +147,18 @@ export class Listener {
       const blob = new Blob(chunks, { type: rec.mimeType || "audio/webm" });
       if (!this.stopped) this.record(stream);
       if (had && blob.size > 2000) {
-        // keep transcripts in order
+        // transcribe in parallel, deliver in order
+        this.pending++;
+        this.status();
+        const p = this.o.transcribe(blob).catch((e: any) => {
+          this.o.onError(e.message || "Transcription failed");
+          return "";
+        });
         this.queue = this.queue.then(async () => {
-          try {
-            const t = (await this.o.transcribe(blob)).trim();
-            if (t && !HALLUCINATIONS.test(t)) this.o.onText(t);
-          } catch (e: any) {
-            this.o.onError(e.message || "Transcription failed");
-          }
+          const t = (await p).trim();
+          this.pending--;
+          this.status();
+          if (t && !HALLUCINATIONS.test(t)) this.o.onText(t);
         });
       }
     };
