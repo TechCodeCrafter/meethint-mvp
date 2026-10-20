@@ -13,6 +13,9 @@ export type Chunk = {
   tf: Map<string, number>;
   len: number;
   pathTokens: Set<string>;
+  /** Precomputed path flags (test file / prose doc). */
+  isTest?: boolean;
+  isDoc?: boolean;
 };
 
 export type Index = {
@@ -23,6 +26,10 @@ export type Index = {
   avgLen: number;
   lineCount: number;
   pathVocab: Set<string>;
+  /** Inverted index: term → flat [chunkId, tf, inPath(0/1), ...] triples. Search only scores these. */
+  postings: Map<string, number[]>;
+  /** Per-chunk BM25 length normaliser k1·(1 − b + b·len/avgLen). */
+  norm: Float64Array;
 };
 
 export type Hit = {
@@ -101,20 +108,26 @@ function stem(w: string): string {
   return w;
 }
 
-/** Split identifiers into parts: getUserPrefs -> get, user, prefs, getuserprefs */
-export function tokenize(text: string, keepStop = false): string[] {
-  const out: string[] = [];
-  const raw = text.match(/[A-Za-z_$][A-Za-z0-9_$]*|\d+/g);
-  if (!raw) return out;
-  for (const word of raw) {
-    const whole = word.toLowerCase().replace(/\$/g, "");
-    if (!whole) continue;
-    const parts = word
-      .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
-      .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
-      .split(/[_\s$]+/)
-      .map((p) => p.toLowerCase())
-      .filter(Boolean);
+// Identifiers repeat constantly across a codebase; cache each word's tokens.
+const WORD_CACHE: [Map<string, string[]>, Map<string, string[]>] = [new Map(), new Map()];
+const EMPTY: string[] = [];
+
+function wordTokens(word: string, keepStop: boolean): string[] {
+  const cache = WORD_CACHE[keepStop ? 1 : 0];
+  const hit = cache.get(word);
+  if (hit) return hit;
+  const whole = word.toLowerCase().replace(/\$/g, "");
+  let out: string[] = EMPTY;
+  if (whole) {
+    out = [];
+    const parts = /[A-Z_$]/.test(word)
+      ? word
+          .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+          .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
+          .split(/[_\s$]+/)
+          .map((p) => p.toLowerCase())
+          .filter(Boolean)
+      : [whole];
     if (parts.length > 1 && whole.length < 40) out.push(stem(whole.replace(/_/g, "")));
     for (const p of parts) {
       if (p.length < 2 && !/\d/.test(p)) continue;
@@ -122,6 +135,17 @@ export function tokenize(text: string, keepStop = false): string[] {
       out.push(stem(p));
     }
   }
+  if (cache.size > 400_000) cache.clear();
+  cache.set(word, out);
+  return out;
+}
+
+/** Split identifiers into parts: getUserPrefs -> get, user, prefs, getuserprefs */
+export function tokenize(text: string, keepStop = false): string[] {
+  const raw = text.match(/[A-Za-z_$][A-Za-z0-9_$]*|\d+/g);
+  if (!raw) return [];
+  const out: string[] = [];
+  for (const word of raw) for (const t of wordTokens(word, keepStop)) out.push(t);
   return out;
 }
 
@@ -150,6 +174,13 @@ export function expandQuery(q: string): QueryTerm[] {
 const CHUNK = 40;
 const STEP = 25;
 
+const K1 = 1.3, B = 0.7;
+function lengthNorms(chunks: Chunk[], avg: number) {
+  const out = new Float64Array(chunks.length);
+  for (let i = 0; i < chunks.length; i++) out[i] = K1 * (1 - B + (B * chunks[i].len) / avg);
+  return out;
+}
+
 export function buildIndex(files: CodeFile[]): Index {
   const chunks: Chunk[] = [];
   const df = new Map<string, number>();
@@ -158,27 +189,41 @@ export function buildIndex(files: CodeFile[]): Index {
   let id = 0;
   const byKey = new Map<string, CodeFile>();
   const pathVocab = new Set<string>();
+  const postings = new Map<string, number[]>();
   for (const f of files) {
     f.key = f.key || (f.src ? f.src + "::" : "") + f.path;
     byKey.set(f.key, f);
     const lines = f.content.split(/\r?\n/);
     lineCount += lines.length;
     const pathTokens = new Set(tokenize(f.path.replace(/\.[a-z0-9]+$/i, "")));
+    const isTest = isTestPath(f.path), isDoc = isDocPath(f.path);
     for (const t of pathTokens) pathVocab.add(t);
+    // Chunks overlap (40 lines, step 25): tokenize each line once and reuse.
+    const lineToks = lines.map((l) => tokenize(l));
     for (let s = 0; s < lines.length; s += STEP) {
       const e = Math.min(lines.length, s + CHUNK);
       const slice = lines.slice(s, e);
-      const toks = tokenize(slice.join("\n"));
       const tf = new Map<string, number>();
-      for (const t of toks) tf.set(t, (tf.get(t) || 0) + 1);
+      let len = 0;
+      for (let i = s; i < e; i++) {
+        const lt = lineToks[i];
+        len += lt.length;
+        for (const t of lt) tf.set(t, (tf.get(t) || 0) + 1);
+      }
       for (const t of pathTokens) tf.set(t, (tf.get(t) || 0) + 2);
-      for (const t of tf.keys()) df.set(t, (df.get(t) || 0) + 1);
-      chunks.push({ id: id++, key: f.key, path: f.path, start: s + 1, end: e, lines: slice, tf, len: toks.length, pathTokens });
-      totalLen += toks.length;
+      const cid = id++;
+      for (const t of tf.keys()) {
+        df.set(t, (df.get(t) || 0) + 1);
+        const f = tf.get(t)!, ip = pathTokens.has(t) ? 1 : 0;
+        const pl = postings.get(t);
+        if (pl) pl.push(cid, f, ip); else postings.set(t, [cid, f, ip]);
+      }
+      chunks.push({ id: cid, key: f.key, path: f.path, start: s + 1, end: e, lines: slice, tf, len, pathTokens, isTest, isDoc });
+      totalLen += len;
       if (e >= lines.length) break;
     }
   }
-  return { files, byKey, chunks, df, avgLen: totalLen / Math.max(1, chunks.length), lineCount, pathVocab };
+  return { files, byKey, chunks, df, avgLen: totalLen / Math.max(1, chunks.length), lineCount, pathVocab, postings, norm: lengthNorms(chunks, totalLen / Math.max(1, chunks.length)) };
 }
 
 function isTestPath(p: string) {
@@ -208,19 +253,48 @@ function lev(a: string, b: string, max: number) {
  * Spoken questions often mis-hear project names ("Maestro POC" for mastra-poc).
  * For query words that never appear in the project, find close project words (paths first).
  */
+const VOCAB_BUCKETS = new WeakMap<Index, { path: Map<string, string[]>; all: Map<string, string[]> }>();
+/** Vocabulary bucketed by first letter (candidates must share it), built once per index. */
+function vocabBuckets(index: Index) {
+  let v = VOCAB_BUCKETS.get(index);
+  if (v) return v;
+  const bucket = (words: Iterable<string>) => {
+    const m = new Map<string, string[]>();
+    for (const w of words) {
+      if (w.length < 4) continue;
+      const a = m.get(w[0]);
+      if (a) a.push(w); else m.set(w[0], [w]);
+    }
+    return m;
+  };
+  v = { path: bucket(index.pathVocab), all: bucket(index.df.keys()) };
+  VOCAB_BUCKETS.set(index, v);
+  return v;
+}
+const CORRECT_CACHE = new WeakMap<Index, Map<string, { from: string; to: string }[]>>();
+/** Max unknown words per question we try to correct (each is a vocabulary scan). */
+const MAX_UNKNOWN = 3;
+
 export function correctTerms(index: Index, question: string): { from: string; to: string }[] {
+  let memo = CORRECT_CACHE.get(index);
+  if (!memo) CORRECT_CACHE.set(index, (memo = new Map()));
+  const cached = memo.get(question);
+  if (cached) return cached;
   const out: { from: string; to: string }[] = [];
+  const buckets = vocabBuckets(index);
+  let unknown = 0;
   const words = [...new Set((question.toLowerCase().match(/[a-z][a-z0-9]{3,}/g) || []).filter((w) => !STOP.has(w)))];
   for (const w of words) {
     const t = stem(w);
     if ((index.df.get(t) || 0) > 0 || (index.df.get(w) || 0) > 0) continue;
+    if (++unknown > MAX_UNKNOWN) break;
     const max = w.length >= 6 ? 2 : 1;
     let best: string | null = null,
       bestD = max + 1,
       bestDf = 0;
     const tryPool = (pool: Iterable<string>, bonus: number) => {
       for (const v of pool) {
-        if (v.length < 4 || v[0] !== w[0]) continue;
+        if (Math.abs(v.length - w.length) > max) continue;
         const raw = lev(w, v, max);
         if (raw > max) continue;
         const d = raw - bonus;
@@ -228,10 +302,12 @@ export function correctTerms(index: Index, question: string): { from: string; to
         if (d < bestD || (d === bestD && df > bestDf)) { best = v; bestD = d; bestDf = df; }
       }
     };
-    tryPool(index.pathVocab, 0.5); // folder / file names are the most likely target
-    if (!best) tryPool(index.df.keys(), 0);
+    tryPool(buckets.path.get(w[0]) || [], 0.5); // folder / file names are the most likely target
+    if (!best) tryPool(buckets.all.get(w[0]) || [], 0);
     if (best && best !== t) out.push({ from: w, to: best });
   }
+  if (memo.size > 200) memo.clear();
+  memo.set(question, out);
   return out;
 }
 
@@ -254,7 +330,7 @@ export function mergeAdjacent(index: Index, hits: Hit[], gap = 14): Hit[] {
   return out;
 }
 
-export function search(index: Index, question: string, k = 6, opts: { boost?: Set<string>; extra?: string; noSplit?: boolean } = {}): Hit[] {
+export function search(index: Index, question: string, k = 6, opts: { boost?: Set<string>; extra?: string; noSplit?: boolean; boostFactor?: number } = {}): Hit[] {
   // "What is X responsible for vs Y?" — make sure both sides get their own sources.
   if (!opts.noSplit) {
     const m = question.match(/^(.*?)\b(?:difference between|differ(?:ence)? from)\b(.*)$/i);
@@ -297,38 +373,54 @@ export function search(index: Index, question: string, k = 6, opts: { boost?: Se
   const wantsTests = /\btests?\b|\bspec\b/i.test(question);
   const wantsDocs = /\b(readme|docs?|documentation)\b/i.test(question);
   const scored: { c: Chunk; s: number; m: string[] }[] = [];
-  for (const c of index.chunks) {
-    let s = 0;
-    const m: string[] = [];
-    let origHits = 0;
-    for (const qt of terms) {
-      const f = c.tf.get(qt.term);
-      if (!f) continue;
-      const n = index.df.get(qt.term) || 0;
-      const idf = Math.log(1 + (N - n + 0.5) / (n + 0.5));
-      s += qt.weight * idf * ((f * (k1 + 1)) / (f + k1 * (1 - b + (b * c.len) / index.avgLen)));
-      if (c.pathTokens.has(qt.term)) s += qt.weight * idf * 0.6;
-      m.push(qt.term);
-      if (qt.original) origHits++;
+  // Term-at-a-time BM25 over the inverted index: only chunks containing a query term are touched.
+  const acc = new Float64Array(N);
+  const orig = new Uint8Array(N);
+  const touched: number[] = [];
+  const origCount = terms.filter((t) => t.original).length || 1;
+  const norm = index.norm;
+  for (const qt of terms) {
+    if (!(qt.weight > 0)) continue;
+    const list = index.postings.get(qt.term);
+    if (!list) continue;
+    const n = list.length / 3;
+    const w = qt.weight * Math.log(1 + (N - n + 0.5) / (n + 0.5));
+    const isOrig = qt.original;
+    for (let i = 0; i < list.length; i += 3) {
+      const cid = list[i], f = list[i + 1];
+      if (acc[cid] === 0) touched.push(cid);
+      acc[cid] += (w * f * (k1 + 1)) / (f + norm[cid]) + (list[i + 2] ? w * 0.6 : 0);
+      if (isOrig && orig[cid] < 255) orig[cid]++;
     }
-    if (!s) continue;
-    // reward chunks covering more distinct original terms
-    const origCount = terms.filter((t) => t.original).length || 1;
-    s *= 0.6 + 0.8 * (origHits / origCount);
-    if (!wantsTests && isTestPath(c.path)) s *= 0.55;
-    if (opts.boost?.has(c.path)) s *= 1.8;
-    if (!wantsDocs && isDocPath(c.path)) s *= 0.7;
-    scored.push({ c, s, m });
   }
-  scored.sort((a, b) => b.s - a.s);
+  for (const cid of touched) {
+    const c = index.chunks[cid];
+    // reward chunks covering more distinct original terms
+    let sc = acc[cid] * (0.6 + 0.8 * (orig[cid] / origCount));
+    if (!wantsTests && c.isTest) sc *= 0.55;
+    if (!wantsDocs && c.isDoc) sc *= 0.7;
+    if (opts.boost?.has(c.path)) sc *= opts.boostFactor ?? 1.8;
+    acc[cid] = sc;
+  }
+  // Only the best few hundred candidates can make the final list; avoid sorting thousands.
+  let cut = -Infinity;
+  if (touched.length > 400) {
+    const vals = new Float64Array(touched.length);
+    for (let i = 0; i < touched.length; i++) vals[i] = acc[touched[i]];
+    vals.sort();
+    cut = vals[vals.length - 400];
+  }
+  for (const cid of touched) if (acc[cid] >= cut && acc[cid] > 0) scored.push({ c: index.chunks[cid], s: acc[cid], m: [] });
+  scored.sort((a, b) => b.s - a.s || a.c.id - b.c.id);
 
   const hits: Hit[] = [];
   const perFile = new Map<string, number>();
   const taken: { path: string; start: number; end: number }[] = [];
   const termSet = new Set(terms.map((t) => t.term));
   const weightOf = new Map(terms.map((t) => [t.term, t.weight]));
-  for (const { c, s, m } of scored) {
+  for (const { c, s } of scored) {
     if (hits.length >= k) break;
+    const m = terms.filter((t) => c.tf.has(t.term)).map((t) => t.term);
     if ((perFile.get(c.key) || 0) >= 2) continue;
     const win = focusWindow(c, termSet, weightOf);
     if (taken.some((t) => t.path === c.key && !(win.end < t.start - 3 || win.start > t.end + 3))) continue;

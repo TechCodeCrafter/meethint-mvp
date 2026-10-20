@@ -3,10 +3,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { buildIndex, search, mergeAdjacent, correctTerms, tokenize, expandQuery, type Hit, type Index, type CodeFile } from "@/lib/search";
 import { extractiveAnswer, type Answer } from "@/lib/answer";
-import { buildTrace, traceHits, traceText, traceAnswer, isFlowQuestion, isNonEvidence, type Trace } from "@/lib/trace";
+import { buildTrace, getGraph, traceHits, traceText, traceAnswer, isFlowQuestion, isNonEvidence, type Trace } from "@/lib/trace";
 import { loadGitHub, loadUploaded, filesFromDrop } from "@/lib/loaders";
 import { DEMO_FILES } from "@/lib/demo";
 import { PROVIDERS, type ProviderId } from "@/lib/providers";
+import { runTask } from "@/lib/ai-core";
+import { transcribe as sttDirect } from "@/lib/stt";
+import { findDuplicate } from "@/lib/dedupe";
+import { splitTldr } from "@/lib/tldr";
+import { verifyCitations } from "@/lib/verify";
+import { updateMomentum, momentumBoost, type Momentum } from "@/lib/momentum";
 import { Mic, Stop, Github, Folder, FileIcon, Code, Sparkle, Gear, X, Copy, Check, External, Chevron, Search, Sun, Moon, Lock, Arrow, Monitor, Layers, Reply, Menu, Bolt } from "./icons";
 import { Listener, BrowserSpeech, NoAudioError, canCaptureMeetingAudio, hasBrowserSpeech, heuristicQuestions, type ListenMode } from "@/lib/listen";
 
@@ -32,10 +38,14 @@ type Result = {
   aiError?: string;
   heard?: boolean;
   trace?: Trace;
+  /** Streaming AI answer text shown while the model is still writing. */
+  draft?: string;
+  /** Where the AI call went: straight to the provider from this browser, or via the self-host server. */
+  via?: "direct" | "server";
 };
 
 type Seg = { id: number; text: string; at: number; q?: boolean };
-type Detected = { id: number; q: string; answered: boolean; at: number; resultId?: number };
+type Detected = { id: number; q: string; answered: boolean; at: number; resultId?: number; repeats?: number };
 
 const EXAMPLE_REPOS = ["sindresorhus/ky", "expressjs/express", "vercel/swr", "supabase/supabase-js"];
 const DEMO_QUESTIONS = [
@@ -46,16 +56,6 @@ const DEMO_QUESTIONS = [
 const ACCEPT =
   ".zip,.pdf,.docx,.pptx,.xlsx,.xls,.ods,.odt,.odp,.rtf,.epub,.ipynb,.md,.mdx,.txt,.csv,.tsv,.json,.yaml,.yml,.toml,.xml,.html,.sql,.js,.jsx,.ts,.tsx,.py,.rb,.go,.rs,.java,.kt,.swift,.c,.cpp,.h,.cs,.php,.sh,.vue,.svelte,.css,.scss,.prisma,.graphql,.proto,.tf,.env.example,*";
 
-function normQ(s: string) {
-  return new Set(s.toLowerCase().match(/[a-z0-9]+/g) || []);
-}
-function similar(a: string, b: string) {
-  const A = normQ(a),
-    B = normQ(b);
-  let i = 0;
-  A.forEach((w) => B.has(w) && i++);
-  return i / Math.max(1, Math.min(A.size, B.size)) > 0.75;
-}
 
 export default function Page() {
   // ---------- sources ----------
@@ -104,6 +104,7 @@ export default function Page() {
   const listenerRef = useRef<{ stop: () => void } | null>(null);
   const segsRef = useRef<Seg[]>([]);
   const detectedRef = useRef<Detected[]>([]);
+  const momentumRef = useRef<Momentum>(new Map());
   const autoRef = useRef(autoAnswer);
   autoRef.current = autoAnswer;
   const transcriptBox = useRef<HTMLDivElement>(null);
@@ -144,13 +145,30 @@ export default function Page() {
     return null;
   }, [sttKey, sttProvider, apiKey, provider, server.stt]);
 
-  const aiBody = () => ({ provider, model: model || undefined, apiKey: apiKey || undefined });
+  /** Your key never touches this site's server: with a key, calls go browser → provider directly.
+   *  Without one, the self-host relay is used only if the server has its own env key. */
+  const aiVia = (): "direct" | "server" => (apiKey.trim() ? "direct" : "server");
+  async function aiCall(body: Record<string, unknown>, o: { onText?: (s: string) => void; signal?: AbortSignal } = {}) {
+    const b = { ...body, provider, model: model || undefined };
+    if (apiKey.trim()) return runTask(b, { key: apiKey.trim(), onText: o.onText });
+    if (!server.server.includes(provider)) throw new Error("Add an API key in AI settings.");
+    const res = await fetch("/api/ai", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(b), signal: o.signal });
+    const j = await res.json();
+    if (!res.ok) throw new Error(j.error || "AI request failed");
+    return j;
+  }
 
   // ---------- index ----------
   const rebuild = useCallback((list: Source[]) => {
     const multi = list.length > 1;
     const files = list.flatMap((s) => s.files.map((f) => ({ ...f, src: multi ? s.label : undefined, key: undefined })));
-    indexRef.current = files.length ? buildIndex(files) : null;
+    const idx = files.length ? buildIndex(files) : null;
+    indexRef.current = idx;
+    // Warm the call graph for Trace mode in the background so the first "how does X work" is fast.
+    if (idx) {
+      const idle = (window as any).requestIdleCallback || ((f: () => void) => setTimeout(f, 200));
+      idle(() => { if (indexRef.current === idx) try { getGraph(idx); } catch {} });
+    }
   }, []);
 
   function addSource(r: { label: string; ref?: string; files: CodeFile[]; skipped: number; truncated?: boolean }, kind: Source["kind"]) {
@@ -219,7 +237,9 @@ export default function Page() {
     const idx = indexRef.current;
     if (!q || !idx) return;
     const t0 = performance.now();
-    let hits = search(idx, q, 8);
+    // Heard questions lean on what the meeting has been discussing (transcript momentum).
+    const boost = opts.heard ? momentumBoost(momentumRef.current) : undefined;
+    let hits = search(idx, q, 8, boost?.size ? { boost, boostFactor: 1.3 } : {});
     let answer = extractiveAnswer(q, hits.slice(0, 6));
     // Trace mode: "how does X work / what calls / which file drives" -> follow the call path in the code.
     let trace: Trace | null = null;
@@ -247,7 +267,7 @@ export default function Page() {
     const ms = Math.round(performance.now() - t0);
     const id = nextId.current++;
     const useAI = aiReady;
-    setResults((r) => [{ id, question: q, hits: trace ? hits : hits.slice(0, 6), answer, ms, ai: useAI ? (trace ? "writing" : "searching") : "off", heard: opts.heard, trace: trace || undefined }, ...r]);
+    setResults((r) => [{ id, question: q, hits: trace ? hits : hits.slice(0, 6), answer, ms, ai: useAI ? (trace ? "writing" : "searching") : "off", heard: opts.heard, trace: trace || undefined, via: useAI ? aiVia() : undefined }, ...r]);
     if (!opts.heard) setQuestion("");
     if (!useAI) return;
 
@@ -259,36 +279,39 @@ export default function Page() {
           const end = Math.min(lines.length, h.end + 2);
           return { n: i + 1, path: (h.src && !h.path.startsWith(h.src + "/") ? h.src + "/" : "") + h.path, start, end, code: lines.slice(start - 1, end).join("\n"), focus: h.focus, hop: h.hop, also: alsoLines(lines, start, end) };
         });
-        const res = await fetch("/api/ai", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ task: "trace", question: q, snippets, trace: traceText(trace, (i) => i + 1), layout: projectLayout(idx), fixes: correctTerms(idx, q), ...aiBody() }),
-        });
-        const j = await res.json();
-        if (!res.ok) throw new Error(j.error || "AI request failed");
+        const j = await aiCall(
+          { task: "trace", question: q, snippets, trace: traceText(trace, (i) => i + 1), layout: projectLayout(idx), fixes: correctTerms(idx, q) },
+          { onText: (d) => d && patch(id, { draft: d }) },
+        );
         // Check every step's citation: it must point at a traced hop whose cited lines perform an action.
         const path = (j.path || []).map((p: { step: string; text: string; cite?: number }) => {
           const h = p.cite ? hits[p.cite - 1] : undefined;
           const evidence = !!h && p.cite! <= hopCount && (h.hop === "prompt" || (h.focus || []).some((ln) => !isNonEvidence(idx.byKey.get(h.key)!.content.split(/\r?\n/)[ln - 1] || "")));
           return { ...p, verified: evidence };
         });
-        const unverified = path.filter((p: { verified: boolean }) => !p.verified).length;
+        const unverifiedSteps = path.filter((p: { verified: boolean }) => !p.verified).length;
+        const unverifiedClaims = verifyCitations([j.answer || "", j.other || ""], (n) => {
+          const h = hits[n - 1];
+          return h ? { path: h.path, content: idx.byKey.get(h.key)!.content } : undefined;
+        });
         patch(id, {
           ai: "done",
+          draft: undefined,
           answer: {
             answer: j.answer || answer.answer,
             keyPoints: [],
             path: path.length ? path : answer.path,
             other: j.other || "",
             openFirst: j.openFirst || answer.openFirst,
-            confidence: unverified ? (j.confidence === "High" ? "Medium" : j.confidence) : j.confidence,
+            confidence: unverifiedSteps || unverifiedClaims.length ? downgrade(j.confidence) : j.confidence,
+            unverified: unverifiedClaims,
             cited: [...new Set([...(path.map((p: { cite?: number }) => p.cite).filter(Boolean) as number[]), ...(j.cited || [])])],
             mode: "ai",
             model: j.model,
           },
         });
       } catch (e: any) {
-        patch(id, { ai: "error", aiError: e.message });
+        patch(id, { ai: "error", aiError: e.message, draft: undefined });
       }
       return;
     }
@@ -300,12 +323,10 @@ export default function Page() {
         const paths = idx.files.map((f) => f.path).slice(0, 2500);
         const ctl = new AbortController();
         const to = setTimeout(() => ctl.abort(), 6000);
-        const ex = await fetch("/api/ai", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ task: "expand", question: q, paths, fixes: correctTerms(idx, q), ...aiBody() }),
-          signal: ctl.signal,
-        }).then((r) => r.json());
+        const ex = await Promise.race([
+          aiCall({ task: "expand", question: q, paths, fixes: correctTerms(idx, q) }, { signal: ctl.signal }),
+          new Promise<never>((_, rej) => ctl.signal.addEventListener("abort", () => rej(new Error("timeout")))),
+        ]);
         clearTimeout(to);
         if (ex.terms?.length || ex.paths?.length) {
           const h2 = search(idx, q, 10, { extra: (ex.terms || []).join(" "), boost: new Set(ex.paths || []) });
@@ -330,19 +351,22 @@ export default function Page() {
         return { n: i + 1, path: (h.src && !h.path.startsWith(h.src + "/") ? h.src + "/" : "") + h.path, loc: h.loc, start, end, code: lines.slice(start - 1, end).join("\n"), also: alsoLines(lines, start, end) };
       });
       const fixes = correctTerms(idx, q);
-      const res = await fetch("/api/ai", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ task: "answer", question: q, snippets, context: opts.context, layout: projectLayout(idx), fixes, ...aiBody() }),
+      const j = await aiCall(
+        { task: "answer", question: q, snippets, context: opts.context, layout: projectLayout(idx), fixes },
+        { onText: (d) => d && patch(id, { draft: d }) },
+      );
+      // Free lexical check: every backticked name/value in a cited sentence must be in that source.
+      const unverified = verifyCitations([j.answer || "", ...(j.keyPoints || [])], (n) => {
+        const h = merged[n - 1];
+        return h ? { path: h.path, content: idx.byKey.get(h.key)!.content } : undefined;
       });
-      const j = await res.json();
-      if (!res.ok) throw new Error(j.error || "AI request failed");
       patch(id, {
         ai: "done",
-        answer: { answer: j.answer, keyPoints: j.keyPoints, confidence: j.confidence, cited: j.cited, mode: "ai", model: j.model },
+        draft: undefined,
+        answer: { answer: j.answer, keyPoints: j.keyPoints, confidence: unverified.length ? downgrade(j.confidence) : j.confidence, cited: j.cited, mode: "ai", model: j.model, unverified },
       });
     } catch (e: any) {
-      patch(id, { ai: "error", aiError: e.message });
+      patch(id, { ai: "error", aiError: e.message, draft: undefined });
     }
   }
   const askRef = useRef(ask);
@@ -356,14 +380,17 @@ export default function Page() {
     const earlier = segsRef.current.slice(-8).map((s) => s.text).join(" ");
     segsRef.current = [...segsRef.current, seg].slice(-80);
     setSegs(segsRef.current);
+    // Warm retrieval on every segment: track which files the conversation is touching.
+    if (indexRef.current && text.split(/\s+/).length >= 4) {
+      try {
+        const h = search(indexRef.current, text, 4, { noSplit: true });
+        momentumRef.current = updateMomentum(momentumRef.current, h.filter((x) => x.score > 0.5).map((x) => x.path));
+      } catch {}
+    }
     let qs: string[] = [];
     if (aiReady) {
       try {
-        const j = await fetch("/api/ai", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ task: "detect", earlier, latest: text, already: detectedRef.current.slice(-8).map((d) => d.q), vocab: indexRef.current ? projectNames(indexRef.current) : "", ...aiBody() }),
-        }).then((r) => r.json());
+        const j = await aiCall({ task: "detect", earlier, latest: text, already: detectedRef.current.slice(-8).map((d) => d.q), vocab: indexRef.current ? projectNames(indexRef.current) : "" });
         qs = j.questions || heuristicQuestions(text);
       } catch {
         qs = heuristicQuestions(text);
@@ -374,7 +401,13 @@ export default function Page() {
       setSegs(segsRef.current);
     }
     for (let q of qs) {
-      if (detectedRef.current.some((d) => similar(d.q, q))) continue;
+      // Fuzzy de-dupe: same question re-asked or re-transcribed within 90s → bump a counter, don't re-answer.
+      const dup = findDuplicate(q, detectedRef.current, Date.now());
+      if (dup >= 0) {
+        detectedRef.current = detectedRef.current.map((d, i) => (i === dup ? { ...d, repeats: (d.repeats || 1) + 1, at: Date.now() } : d));
+        setDetected([...detectedRef.current]);
+        continue;
+      }
       q = q.charAt(0).toUpperCase() + q.slice(1);
       const d: Detected = { id: Date.now() + Math.random(), q, answered: false, at: Date.now() };
       if (autoRef.current && indexRef.current) {
@@ -435,7 +468,8 @@ export default function Page() {
         const fd = new FormData();
         fd.append("file", blob, "seg.webm");
         fd.append("provider", stt.provider);
-        if (stt.key) fd.append("apiKey", stt.key);
+        // Own key: straight to the provider from this browser. No key: self-host relay with the server's env key.
+        if (stt.key) return sttDirect({ provider: stt.provider, key: stt.key, file: blob });
         const r = await fetch("/api/transcribe", { method: "POST", body: fd });
         const j = await r.json();
         if (!r.ok) throw new Error(j.error || "Transcription failed");
@@ -889,7 +923,7 @@ export default function Page() {
                         <span className="heard-tag">Question heard</span>
                         <span className="heard-time">{timeAgo(latestHeard.at, now)}</span>
                       </div>
-                      <p className="heard-q">{latestHeard.q}</p>
+                      <p className="heard-q">{latestHeard.q}{(latestHeard.repeats || 1) > 1 && <span className="repeat-badge" title="Asked again — merged, not re-answered">×{latestHeard.repeats}</span>}</p>
                       {latestResult ? (
                         <>
                           {latestResult.ai === "searching" || latestResult.ai === "writing" ? (
@@ -912,7 +946,7 @@ export default function Page() {
                     <div className="earlier">
                       {[...detected].reverse().slice(1, 5).map((d) => (
                         <button key={d.id} className="earlier-item" onClick={() => (d.answered ? scrollToResult(d.resultId) : answerDetected(d))}>
-                          <span>{d.q}</span>
+                          <span>{d.q}{(d.repeats || 1) > 1 && <span className="repeat-badge">×{d.repeats}</span>}</span>
                           {d.answered ? <Chevron size={14} /> : <span className="tiny-chip">Answer</span>}
                         </button>
                       ))}
@@ -993,6 +1027,30 @@ export default function Page() {
               <label className="lbl" htmlFor="m">Model <span className="opt">optional</span></label>
               <input id="m" className="field" placeholder={`Default: ${PROVIDERS[provider].model}`} value={model} onChange={(e) => setModel(e.target.value)} aria-label="Model" />
 
+              <div className="keypath" aria-label="Where your key goes">
+                <div className="kp-title"><Lock size={13} /> Where your key goes</div>
+                {apiKey.trim() || !server.server.includes(provider) ? (
+                  <>
+                    <div className="kp-flow">
+                      <span>This tab&apos;s memory</span><Arrow size={13} /><code>{new URL(PROVIDERS[provider].base).host}</code>
+                    </div>
+                    <p>
+                      Your browser sends the key straight to {PROVIDERS[provider].label}. This site&apos;s server never receives it: its AI routes refuse any request that carries a key,
+                      and the page&apos;s security policy only allows connections to AI providers and GitHub. Check it yourself in DevTools → Network.
+                      Nothing is saved; closing the tab forgets it.
+                    </p>
+                  </>
+                ) : (
+                  <>
+                    <div className="kp-flow">
+                      <span>This site&apos;s server key</span><Arrow size={13} /><code>{new URL(PROVIDERS[provider].base).host}</code>
+                    </div>
+                    <p>No key needed: this deployment has its own {PROVIDERS[provider].label} key, so questions and code snippets go through this server to the provider. Add your own key to go direct.</p>
+                  </>
+                )}
+                <p className="kp-self">Want to trust no one? <a href="https://github.com/TechCodeCrafter/meethint-mvp#self-host" target="_blank" rel="noreferrer">Self-host it</a>: one <code>npm run dev</code> or a Vercel deploy.</p>
+              </div>
+
               <div className="divider" />
               <label className="lbl">Transcription for listening</label>
               <p className="help">
@@ -1010,7 +1068,7 @@ export default function Page() {
               <span className="status-line">
                 <span className={`ai-dot ${aiReady ? "on" : ""}`} /> {aiReady ? "AI answers on" : "AI answers off"} · {stt ? "transcription ready" : "free browser speech only"}
               </span>
-              <span className="help"><Lock size={12} /> Keys stay in this tab&apos;s memory only.</span>
+              <span className="help"><Lock size={12} /> Keys stay in this tab&apos;s memory and go direct to the provider.</span>
               <button className="btn primary" onClick={() => setShowAI(false)}>Done</button>
             </div>
           </div>
@@ -1160,6 +1218,10 @@ function citeOrder(r: Result) {
 }
 
 /** Path for display: drop a leading folder that just repeats the source name. */
+function downgrade(c: Answer["confidence"]): Answer["confidence"] {
+  return c === "High" ? "Medium" : "Low";
+}
+
 function shortPath(h: Hit) {
   if (h.src && h.path.startsWith(h.src + "/")) return h.path.slice(h.src.length + 1);
   return h.path;
@@ -1171,7 +1233,8 @@ function AnswerCard({ r, multi, latest, onFollow }: { r: Result; multi: boolean;
   const [showOther, setShowOther] = useState(false);
   const [copied, setCopied] = useState(false);
   const [expanded, setExpanded] = useState<boolean | null>(null);
-  const isExpanded = expanded ?? latest;
+  // TL;DR first: every card opens collapsed; details, steps text and code are one tap away.
+  const isExpanded = expanded ?? false;
   const termSet = useMemo(() => new Set(expandQuery(r.question).filter((t) => t.original).map((t) => t.term)), [r.question]);
   const a = r.answer;
   const { cited, other, remap } = citeOrder(r);
@@ -1242,7 +1305,7 @@ function AnswerCard({ r, multi, latest, onFollow }: { r: Result; multi: boolean;
         <div className="answer-tags">
           {r.heard ? <span className="tag heard"><Mic size={12} /> Heard in meeting</span> : <span className="tag">Asked</span>}
           {r.trace && <span className="tag tracetag"><Layers size={12} /> Trace</span>}
-          {a.mode === "ai" ? <span className="tag ai"><Sparkle size={12} /> {a.model}</span> : <span className="tag"><Bolt size={12} /> From the code</span>}
+          {a.mode === "ai" ? <span className="tag ai" title={r.via === "direct" ? "Sent from your browser straight to the provider. This site's server never saw your key." : "Answered by this site's own server key (self-host relay)."}><Sparkle size={12} /> {a.model}{r.via === "direct" && <Lock size={11} />}</span> : <span className="tag"><Bolt size={12} /> From the code</span>}
           <span className={`tag conf ${a.confidence}`}><i />{a.confidence} match</span>
           <span className="tag dim">{r.ms} ms</span>
         </div>
@@ -1253,10 +1316,34 @@ function AnswerCard({ r, multi, latest, onFollow }: { r: Result; multi: boolean;
       </header>
       <h3 className="answer-q">{r.question}</h3>
 
-      {loading && a.mode !== "ai" && (
+      {loading && a.mode !== "ai" && !r.draft && (
         <div className="thinking"><span className="spinner" />{r.ai === "searching" ? "Searching deeper…" : "Writing a clear answer…"}<span className="shimmer" /></div>
       )}
-      <p className={`answer-text ${loading && a.mode !== "ai" ? "pending" : ""}`}>{renderInline(remap(a.answer), cite)}</p>
+      {(() => {
+        const streaming = !!r.draft && a.mode !== "ai" && r.draft.length > 24;
+        const [tldr, rest] = splitTldr(remap(streaming ? r.draft! : a.answer));
+        return (
+          <div className={`answer-body ${streaming ? "streaming" : ""}`}>
+            <p className={`answer-text tldr ${loading && a.mode !== "ai" && !streaming ? "pending" : ""}`}>
+              {renderInline(tldr, cite)}
+              {streaming && !rest && <span className="acaret" />}
+            </p>
+            {rest && (isExpanded || streaming) && (
+              <p className="answer-text rest">{renderInline(rest, cite)}{streaming && <span className="acaret" />}</p>
+            )}
+            {rest && !isExpanded && !streaming && (
+              <button className="tldr-more" onClick={() => setExpanded(true)}>Read more</button>
+            )}
+          </div>
+        );
+      })()}
+      {a.unverified && a.unverified.length > 0 && (
+        <div className="verify-note" title={a.unverified.map((u) => `[${u.n}] missing: ${u.terms.join(", ")}`).join("\n")}>
+          <span className="tag warn">Check</span>
+          {a.unverified.length === 1 ? "1 claim names" : `${a.unverified.length} claims name`} something its cited source doesn&apos;t contain:{" "}
+          {a.unverified.slice(0, 3).flatMap((u) => u.terms).slice(0, 4).map((t, i) => <code key={i}>{t}</code>)}
+        </div>
+      )}
       {r.ai === "error" && <div className="alert danger sm">AI couldn&apos;t answer: {r.aiError?.slice(0, 160)}. Showing the instant answer from the code.</div>}
 
       {a.path && a.path.length > 0 && (

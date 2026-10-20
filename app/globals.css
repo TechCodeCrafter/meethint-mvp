@@ -529,3 +529,27 @@ kbd { font-size: 11px; padding: 1px 6px; border-radius: 5px; border: 1px solid v
   .source-row .hop-chip { display: none; }
 }
 .tag { white-space: nowrap; }
+
+/* ---------- TL;DR-first + streaming ---------- */
+.answer-body { margin: 4px 0 12px; }
+.answer-text.tldr { margin: 0; font-weight: 500; }
+.answer-text.rest { margin: 8px 0 0; font-size: 16px; color: var(--muted); animation: fadein .25s ease; }
+.tldr-more { margin-top: 6px; padding: 0; border: 0; background: none; color: var(--accent); font-size: 13.5px; font-weight: 500; cursor: pointer; }
+.tldr-more:hover { text-decoration: underline; }
+.answer-body.streaming .answer-text { animation: fadein .25s ease; }
+.acaret { display: inline-block; width: 7px; height: 1.05em; margin-left: 3px; vertical-align: -0.15em; border-radius: 2px; background: var(--accent); animation: caretblink 1s steps(2) infinite; }
+@keyframes caretblink { 50% { opacity: 0; } }
+@keyframes fadein { from { opacity: .35; } to { opacity: 1; } }
+.tag.ai svg:last-child { margin-left: 2px; opacity: .8; }
+.repeat-badge { margin-left: 6px; padding: 1px 6px; border-radius: 999px; font-size: 11px; font-weight: 600; color: var(--muted); background: var(--panel-3); border: 1px solid var(--line); }
+@media (prefers-reduced-motion: reduce) { .acaret, .answer-text.rest, .answer-body.streaming .answer-text { animation: none; } }
+.keypath { margin-top: 14px; padding: 12px 14px; border-radius: 12px; border: 1px solid var(--line); background: var(--panel-2); font-size: 13px; color: var(--muted); }
+.kp-title { display: flex; align-items: center; gap: 6px; font-weight: 600; color: var(--ink); margin-bottom: 8px; }
+.kp-flow { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; color: var(--ink); }
+.kp-flow span { padding: 2px 8px; border-radius: 999px; background: var(--panel-3); border: 1px solid var(--line); }
+.kp-flow code, .kp-self code { padding: 2px 6px; border-radius: 6px; background: var(--panel-3); border: 1px solid var(--line); color: var(--ink); }
+.keypath p { margin: 0; line-height: 1.5; }
+.keypath .kp-self { margin-top: 8px; }
+.keypath a { color: var(--accent); }
+.verify-note { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: -4px 0 12px; font-size: 13px; color: var(--muted); }
+.verify-note code { font-size: 12px; padding: 1px 6px; border-radius: 6px; background: var(--panel-3); border: 1px solid var(--line); color: var(--ink); }

@@ -1,11 +1,18 @@
 {
-  "name": "code-meeting-answerer",
-  "private": true,
+  "name": "meethint",
   "version": "0.1.0",
+  "description": "Answer questions about your codebase live in meetings, with file and line citations. Runs in the browser; your AI key goes straight to the provider.",
+  "license": "MIT",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/TechCodeCrafter/meethint-mvp"
+  },
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start"
+    "start": "next start",
+    "test": "node --import tsx --test tests/*.test.ts"
   },
   "dependencies": {
     "jszip": "^3.10.2",
@@ -16,6 +23,7 @@
   "devDependencies": {
     "@types/node": "^26.6.5",
     "@types/react": "^19.3.0",
+    "tsx": "^4.23.15",
     "typescript": "^5.9.3"
   }
 }

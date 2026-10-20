@@ -67,7 +67,7 @@ export function isNonEvidence(line: string) {
 
 /* ---------------- definitions ---------------- */
 
-function pyDefs(f: CodeFile, key: string, lines: string[]): Def[] {
+export function pyDefs(f: CodeFile, key: string, lines: string[]): Def[] {
   const out: Def[] = [];
   for (let i = 0; i < lines.length; i++) {
     const m = lines[i].match(/^(\s*)(?:async\s+)?def\s+(\w+)\s*\(/);
@@ -112,7 +112,7 @@ const JS_DEF_RES = [
   /^\s*(\w+)\s*:\s*(?:async\s+)?(?:function\b|\([^)]*\)\s*=>)/,
 ];
 
-function jsDefs(f: CodeFile, key: string, lines: string[]): Def[] {
+export function jsDefs(f: CodeFile, key: string, lines: string[]): Def[] {
   const out: Def[] = [];
   for (let i = 0; i < lines.length; i++) {
     const l = lines[i];
@@ -323,11 +323,22 @@ export function isFlowQuestion(q: string) {
 function qTerms(q: string) {
   return new Set(expandQuery(q).filter((t) => t.original).map((t) => t.term));
 }
-function overlap(terms: Set<string>, text: string) {
-  const toks = new Set(tokenize(text));
+// Def names and paths repeat across every trace; cache their token sets.
+const OVERLAP_TOKS = new Map<string, Set<string>>();
+function overlapTokens(text: string) {
+  let toks = OVERLAP_TOKS.get(text);
+  if (toks) return toks;
+  toks = new Set(tokenize(text));
   // adjacent word pairs, so "rule-builder" also matches the phrase "rule builder"
   const words = text.replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
   for (let i = 0; i + 1 < words.length; i++) toks.add(words[i] + words[i + 1]);
+  if (OVERLAP_TOKS.size > 50_000) OVERLAP_TOKS.clear();
+  OVERLAP_TOKS.set(text, toks);
+  return toks;
+}
+
+function overlap(terms: Set<string>, text: string) {
+  const toks = overlapTokens(text);
   let n = 0;
   for (const t of toks) if (terms.has(t)) n++;
   return n;
@@ -486,7 +497,7 @@ export function buildTrace(index: Index, q: string, hits: Hit[]): Trace | null {
     const fn = entry.fn;
     // UI caller of the client function (component -> api wrapper)
     if (fn) {
-      const keys = new Set([...g.lines.entries()].filter(([, ls]) => ls.some((l) => l.includes(fn.name))).map(([k]) => k));
+      const keys = new Set([...g.lines.keys()].filter((k) => index.byKey.get(k)?.content.includes(fn.name)));
       const callers = g.defs
         .filter((d) => keys.has(d.key) && (d.key !== fn.key || d.name !== fn.name))
         .filter((d) => {
@@ -689,16 +700,23 @@ function dedupeSel(s: Trace["selects"]) {
 }
 
 /** Convert hops into display/LLM sources with focused line ranges. */
+/**
+ * Window to show for a hop: the whole def if it's ≤ 45 lines, otherwise a ≤ 45-line slice from
+ * 4 lines above the first action line to 6 below the last, clamped to the def.
+ */
+export function focusWindow(defStart: number, defEnd: number, focus: number[], max = 45): { start: number; end: number } {
+  if (defEnd - defStart <= max) return { start: defStart, end: defEnd };
+  const f = focus.length ? focus : [defStart];
+  const start = Math.max(defStart, Math.min(...f) - 4);
+  const end = Math.min(defEnd, Math.max(...f) + 6, start + max);
+  return { start, end };
+}
+
 export function traceHits(index: Index, t: Trace): Hit[] {
   const g = getGraph(index);
   return t.hops.map((h) => {
     const ls = g.lines.get(h.key) || index.byKey.get(h.key)?.content.split(/\r?\n/) || [];
-    let start = h.start, end = h.end;
-    if (end - start > 45) {
-      const f = h.focus.length ? h.focus : [start];
-      start = Math.max(h.start, Math.min(...f) - 4);
-      end = Math.min(h.end, Math.max(...f) + 6, start + 45);
-    }
+    const { start, end } = focusWindow(h.start, h.end, h.focus);
     const f = index.byKey.get(h.key);
     return {
       key: h.key, path: h.path, src: h.src, origin: f?.origin, doc: false,

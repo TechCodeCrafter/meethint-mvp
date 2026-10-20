@@ -11,6 +11,8 @@ export type Answer = {
   path?: { step: string; text: string; cite?: number; verified?: boolean }[];
   other?: string;
   openFirst?: { file: string; why: string };
+  /** Claims whose backticked names/values were not found in the source they cite. */
+  unverified?: { n: number; terms: string[]; text: string }[];
 };
 
 type Found = { text: string; path: string; line: number; score: number };
