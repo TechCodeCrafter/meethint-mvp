@@ -5,7 +5,7 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
 
-type Snippet = { n: number; path: string; loc?: string; start: number; end: number; code: string };
+type Snippet = { n: number; path: string; loc?: string; start: number; end: number; code: string; also?: { line: number; text: string }[] };
 
 const ANSWER_SYS = `You are a senior engineer answering a colleague's question live in a meeting, using ONLY the provided sources (code and documents from their project). The answer is read aloud-in-a-glance, so it must be SHORT.
 Rules:
@@ -15,18 +15,29 @@ Rules:
 - Cite with bare numeric markers like [1] or [2][3] right after the claim. NEVER write "[Sources: ...]", "[See sources below]", "[Files: ...]", or file names inside square brackets.
 - "keyPoints": 0-3 bullets, each max 18 words, concrete facts only, each ending with [n]. Don't repeat the answer.
 - Ignore irrelevant sources (third-party/library code, unrelated files) and don't cite them.
+Accuracy rules (most important):
+- Different top-level folders / services / languages are usually DIFFERENT components (e.g. a TypeScript container vs a Python app, a new runtime vs an older/rollback one). Describe each component ONLY from its own files. Never say component A "runs", "uses" or "contains" B unless a source shows it (an import, a call, a config value, or a doc sentence saying so).
+- If the question compares X and Y, answer for each side from the sources under that side's own folder, then state the relationship only if a source shows it (e.g. a router choosing between engines).
+- If a setting/default appears more than once (see "Other lines in this file"), say which value applies where instead of giving one value.
+- The question may come from speech recognition and mis-hear names; use the project's real names (see "Name corrections" and the folder map).
+- If the sources don't cover one part of the question, say that part isn't in the sources rather than guessing.
 Return ONLY JSON: {"answer": string, "keyPoints": string[], "cited": number[], "confidence": "High"|"Medium"|"Low"}`;
 
 const EXPAND_SYS = `You help search a codebase / document set. Given a question and a list of file paths in the project, return search terms that would appear in the relevant code or docs (identifiers in camelCase/snake_case, function or table names, config keys, domain words, synonyms), and the paths most likely to contain the answer.
 Return ONLY JSON: {"terms": string[] (8-20 items), "paths": string[] (0-8 items, copied exactly from the list)}`;
 
 const DETECT_SYS = `You listen to a live meeting transcript. Find questions someone asked in the LATEST segment that could be answered from the team's codebase or project documents (how something works, where something lives, current values/limits/configs, behaviour, architecture, what a document says).
-- Keep the speaker's own wording. Only fix transcription glitches and replace a vague "it"/"that" with the thing it refers to. Do NOT expand, elaborate, or add sub-questions.
+- Keep the speaker's own wording. Only fix transcription glitches (especially mis-heard project names: map them to the closest name from the project names list, e.g. "Maestro POC" -> "mastra-poc") and replace a vague "it"/"that" with the thing it refers to. Do NOT expand, elaborate, or add sub-questions.
 - Each question must be max 20 words and end with "?".
 - Skip small talk, scheduling, opinions, and questions already in the "already detected" list.
 - Ignore garbled text, lists of words, or segments that are not natural speech.
 - Only include a question if it's reasonably complete.
 Return ONLY JSON: {"questions": string[]} (usually 0 or 1 items).`;
+
+function fixText(f: unknown) {
+  if (!Array.isArray(f) || !f.length) return "";
+  return `\nName corrections (speech recognition likely mis-heard): ${f.map((x: any) => `"${x.from}" means "${x.to}"`).join(", ")}`;
+}
 
 function cleanCites(t: string) {
   return t
@@ -50,7 +61,9 @@ function sourcesBlock(snippets: Snippet[]) {
       return `[${s.n}] ${s.path}${s.loc ? ` (${s.loc})` : ""} lines ${s.start}-${s.end}\n\`\`\`\n${code
         .split("\n")
         .map((l, i) => `${s.start + i}: ${l}`)
-        .join("\n")}\n\`\`\``;
+        .join("\n")}\n\`\`\`${
+        s.also?.length ? `\nOther lines in this file using the same names:\n${s.also.map((a) => `${a.line}: ${a.text}`).join("\n")}` : ""
+      }`;
     })
     .filter(Boolean)
     .join("\n\n");
@@ -62,7 +75,7 @@ export async function POST(req: Request) {
     const common = { provider: (b.provider || "openai") as ProviderId, model: b.model, apiKey: b.apiKey };
     if (b.task === "expand") {
       const paths: string = (b.paths || []).join("\n").slice(0, 14000);
-      const { text } = await callLLM({ ...common, system: EXPAND_SYS, user: `Question: ${b.question}\n\nFile paths:\n${paths}`, maxTokens: 400 });
+      const { text } = await callLLM({ ...common, system: EXPAND_SYS, user: `Question: ${b.question}${fixText(b.fixes)}\n\nFile paths:\n${paths}`, maxTokens: 400 });
       const j = parseJson(text);
       return Response.json({ terms: (j.terms || []).map(String).slice(0, 24), paths: (j.paths || []).map(String).slice(0, 8) });
     }
@@ -70,7 +83,7 @@ export async function POST(req: Request) {
       const { text } = await callLLM({
         ...common,
         system: DETECT_SYS,
-        user: `Earlier transcript:\n${String(b.earlier || "").slice(-3000)}\n\nLATEST segment:\n${String(b.latest || "").slice(0, 2000)}\n\nAlready detected:\n${(b.already || []).join("\n")}`,
+        user: `${b.vocab ? `Project names (folders/files):\n${String(b.vocab).slice(0, 3000)}\n\n` : ""}Earlier transcript:\n${String(b.earlier || "").slice(-3000)}\n\nLATEST segment:\n${String(b.latest || "").slice(0, 2000)}\n\nAlready detected:\n${(b.already || []).join("\n")}`,
         maxTokens: 300,
       });
       const j = parseJson(text);
@@ -82,7 +95,7 @@ export async function POST(req: Request) {
     const { text, model } = await callLLM({
       ...common,
       system: ANSWER_SYS,
-      user: `${ctx}Question: ${String(b.question).slice(0, 2000)}\n\nSources:\n\n${sourcesBlock(b.snippets)}`,
+      user: `${ctx}${b.layout ? `Project folder map (file counts):\n${String(b.layout).slice(0, 4000)}\n\n` : ""}Question: ${String(b.question).slice(0, 2000)}${fixText(b.fixes)}\n\nSources:\n\n${sourcesBlock(b.snippets)}`,
       maxTokens: 1000,
     });
     const out = parseJson(text);

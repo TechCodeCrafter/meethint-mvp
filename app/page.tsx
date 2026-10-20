@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { buildIndex, search, tokenize, expandQuery, type Hit, type Index, type CodeFile } from "@/lib/search";
+import { buildIndex, search, mergeAdjacent, correctTerms, tokenize, expandQuery, type Hit, type Index, type CodeFile } from "@/lib/search";
 import { extractiveAnswer, type Answer } from "@/lib/answer";
 import { loadGitHub, loadUploaded, filesFromDrop } from "@/lib/loaders";
 import { DEMO_FILES } from "@/lib/demo";
@@ -236,7 +236,7 @@ export default function Page() {
         const ex = await fetch("/api/ai", {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ task: "expand", question: q, paths, ...aiBody() }),
+          body: JSON.stringify({ task: "expand", question: q, paths, fixes: correctTerms(idx, q), ...aiBody() }),
           signal: ctl.signal,
         }).then((r) => r.json());
         clearTimeout(to);
@@ -247,6 +247,7 @@ export default function Page() {
             const k = `${h.key}:${Math.floor(h.start / 20)}`;
             return seen.has(k) ? false : (seen.add(k), true);
           }).slice(0, 10);
+          merged = mergeAdjacent(idx, merged);
         }
       } catch {}
       if (!merged.length) {
@@ -259,12 +260,13 @@ export default function Page() {
         const lines = file.content.split(/\r?\n/);
         const start = Math.max(1, h.start - 12);
         const end = Math.min(lines.length, h.end + 12);
-        return { n: i + 1, path: (h.src ? h.src + " › " : "") + h.path, loc: h.loc, start, end, code: lines.slice(start - 1, end).join("\n") };
+        return { n: i + 1, path: (h.src && !h.path.startsWith(h.src + "/") ? h.src + "/" : "") + h.path, loc: h.loc, start, end, code: lines.slice(start - 1, end).join("\n"), also: alsoLines(lines, start, end) };
       });
+      const fixes = correctTerms(idx, q);
       const res = await fetch("/api/ai", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ task: "answer", question: q, snippets, context: opts.context, ...aiBody() }),
+        body: JSON.stringify({ task: "answer", question: q, snippets, context: opts.context, layout: projectLayout(idx), fixes, ...aiBody() }),
       });
       const j = await res.json();
       if (!res.ok) throw new Error(j.error || "AI request failed");
@@ -293,7 +295,7 @@ export default function Page() {
         const j = await fetch("/api/ai", {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ task: "detect", earlier, latest: text, already: detectedRef.current.slice(-8).map((d) => d.q), ...aiBody() }),
+          body: JSON.stringify({ task: "detect", earlier, latest: text, already: detectedRef.current.slice(-8).map((d) => d.q), vocab: indexRef.current ? projectNames(indexRef.current) : "", ...aiBody() }),
         }).then((r) => r.json());
         qs = j.questions || heuristicQuestions(text);
       } catch {
@@ -968,6 +970,47 @@ function clock(t: number) {
 function timeAgo(t: number, now: number) {
   const s = Math.max(0, Math.round((now - t) / 1000));
   return s < 5 ? "just now" : s < 60 ? `${s}s ago` : `${Math.round(s / 60)} min ago`;
+}
+
+/** Other lines in the file that use the same config/env names as the snippet (e.g. a second BRIDGE_PORT default). */
+function alsoLines(lines: string[], start: number, end: number) {
+  const snippet = lines.slice(start - 1, end).join("\n");
+  const names = new Set<string>();
+  for (const m of snippet.matchAll(/\b[A-Z][A-Z0-9]*_[A-Z0-9_]{2,}\b/g)) names.add(m[0]);
+  if (!names.size) return [];
+  const out: { line: number; text: string }[] = [];
+  for (let i = 0; i < lines.length && out.length < 10; i++) {
+    if (i >= start - 1 && i < end) continue;
+    const l = lines[i];
+    for (const n of names) if (l.includes(n)) { out.push({ line: i + 1, text: l.trim().slice(0, 200) }); break; }
+  }
+  return out;
+}
+
+/** Compact folder map so the model knows which directories are separate components. */
+function projectLayout(idx: Index) {
+  const count = new Map<string, number>();
+  for (const f of idx.files) {
+    const parts = ((f.src && !f.path.startsWith(f.src + "/") ? f.src + "/" : "") + f.path).split("/");
+    for (let d = 1; d <= Math.min(3, parts.length - 1); d++) {
+      const k = parts.slice(0, d).join("/") + "/";
+      count.set(k, (count.get(k) || 0) + 1);
+    }
+  }
+  return [...count.entries()].filter(([, n]) => n >= 2).sort((a, b) => a[0].localeCompare(b[0])).slice(0, 120).map(([k, n]) => `${k} (${n})`).join("\n");
+}
+
+/** Folder and file names, used to fix mis-heard names in the transcript. */
+function projectNames(idx: Index) {
+  const names = new Set<string>();
+  for (const f of idx.files) {
+    const parts = f.path.split("/");
+    parts.slice(0, -1).forEach((p) => p.length > 2 && !p.startsWith(".") && names.add(p));
+    const base = parts[parts.length - 1].replace(/\.[a-z0-9]+$/i, "");
+    if (base.length > 3) names.add(base);
+    if (names.size > 300) break;
+  }
+  return [...names].join(", ").slice(0, 3000);
 }
 
 const HALLUCINATIONS = /^(thank you( so much)?( for watching)?|thanks for watching|please subscribe|subtitles? by.*|you|bye|\.+|okay\.?|so\.?|um+\.?|uh+\.?)[.!\s]*$/i;
