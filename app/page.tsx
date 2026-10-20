@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { buildIndex, search, mergeAdjacent, correctTerms, tokenize, expandQuery, type Hit, type Index, type CodeFile } from "@/lib/search";
 import { extractiveAnswer, type Answer } from "@/lib/answer";
+import { buildTrace, traceHits, traceText, traceAnswer, isFlowQuestion, isNonEvidence, type Trace } from "@/lib/trace";
 import { loadGitHub, loadUploaded, filesFromDrop } from "@/lib/loaders";
 import { DEMO_FILES } from "@/lib/demo";
 import { PROVIDERS, type ProviderId } from "@/lib/providers";
@@ -30,6 +31,7 @@ type Result = {
   ai: "off" | "searching" | "writing" | "done" | "error";
   aiError?: string;
   heard?: boolean;
+  trace?: Trace;
 };
 
 type Seg = { id: number; text: string; at: number; q?: boolean };
@@ -217,14 +219,79 @@ export default function Page() {
     const idx = indexRef.current;
     if (!q || !idx) return;
     const t0 = performance.now();
-    const hits = search(idx, q, 8);
-    const answer = extractiveAnswer(q, hits.slice(0, 6));
+    let hits = search(idx, q, 8);
+    let answer = extractiveAnswer(q, hits.slice(0, 6));
+    // Trace mode: "how does X work / what calls / which file drives" -> follow the call path in the code.
+    let trace: Trace | null = null;
+    let hopCount = 0;
+    if (isFlowQuestion(q)) {
+      try { trace = buildTrace(idx, q, hits); } catch (e) { console.warn("trace failed", e); }
+      if (trace && trace.hops.length < 2 && !trace.stops.length && !trace.uncalled.length) trace = null;
+    }
+    if (trace) {
+      const th = traceHits(idx, trace);
+      hopCount = th.length;
+      const extra = hits.filter((h) => !th.some((t) => t.key === h.key && !(h.start > t.end + 5 || h.end < t.start - 5))).slice(0, 3);
+      hits = [...th, ...extra];
+      const ta = traceAnswer(trace);
+      answer = {
+        answer: ta.answer,
+        keyPoints: ta.keyPoints,
+        confidence: trace.stops.length || !trace.entry ? "Medium" : "High",
+        mode: "extractive",
+        cited: th.map((_, i) => i + 1),
+        path: trace.hops.map((h, i) => ({ step: STEP_LABEL[h.kind], text: codeify(h.label), cite: i + 1, verified: true })),
+        openFirst: trace.openFirst ? { file: trace.openFirst.path, why: trace.openFirst.why } : undefined,
+      };
+    }
     const ms = Math.round(performance.now() - t0);
     const id = nextId.current++;
     const useAI = aiReady;
-    setResults((r) => [{ id, question: q, hits: hits.slice(0, 6), answer, ms, ai: useAI ? "searching" : "off", heard: opts.heard }, ...r]);
+    setResults((r) => [{ id, question: q, hits: trace ? hits : hits.slice(0, 6), answer, ms, ai: useAI ? (trace ? "writing" : "searching") : "off", heard: opts.heard, trace: trace || undefined }, ...r]);
     if (!opts.heard) setQuestion("");
     if (!useAI) return;
+
+    if (trace) {
+      try {
+        const snippets = hits.map((h, i) => {
+          const lines = idx.byKey.get(h.key)!.content.split(/\r?\n/);
+          const start = Math.max(1, h.start - 2);
+          const end = Math.min(lines.length, h.end + 2);
+          return { n: i + 1, path: (h.src && !h.path.startsWith(h.src + "/") ? h.src + "/" : "") + h.path, start, end, code: lines.slice(start - 1, end).join("\n"), focus: h.focus, hop: h.hop, also: alsoLines(lines, start, end) };
+        });
+        const res = await fetch("/api/ai", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ task: "trace", question: q, snippets, trace: traceText(trace, (i) => i + 1), layout: projectLayout(idx), fixes: correctTerms(idx, q), ...aiBody() }),
+        });
+        const j = await res.json();
+        if (!res.ok) throw new Error(j.error || "AI request failed");
+        // Check every step's citation: it must point at a traced hop whose cited lines perform an action.
+        const path = (j.path || []).map((p: { step: string; text: string; cite?: number }) => {
+          const h = p.cite ? hits[p.cite - 1] : undefined;
+          const evidence = !!h && p.cite! <= hopCount && (h.hop === "prompt" || (h.focus || []).some((ln) => !isNonEvidence(idx.byKey.get(h.key)!.content.split(/\r?\n/)[ln - 1] || "")));
+          return { ...p, verified: evidence };
+        });
+        const unverified = path.filter((p: { verified: boolean }) => !p.verified).length;
+        patch(id, {
+          ai: "done",
+          answer: {
+            answer: j.answer || answer.answer,
+            keyPoints: [],
+            path: path.length ? path : answer.path,
+            other: j.other || "",
+            openFirst: j.openFirst || answer.openFirst,
+            confidence: unverified ? (j.confidence === "High" ? "Medium" : j.confidence) : j.confidence,
+            cited: [...new Set([...(path.map((p: { cite?: number }) => p.cite).filter(Boolean) as number[]), ...(j.cited || [])])],
+            mode: "ai",
+            model: j.model,
+          },
+        });
+      } catch (e: any) {
+        patch(id, { ai: "error", aiError: e.message });
+      }
+      return;
+    }
 
     try {
       // Step 1: let the model suggest identifiers + likely files, then search again.
@@ -1013,6 +1080,17 @@ function projectNames(idx: Index) {
   return [...names].join(", ").slice(0, 3000);
 }
 
+/** Wrap function calls, routes and file names in backticks for display. */
+function codeify(t: string) {
+  return t
+    .replace(/\b(GET|POST|PUT|PATCH|DELETE|WS|ANY) (\/[^\s,;)]*)/g, "`$1 $2`")
+    .replace(/(^|[\s(])([A-Za-z_$][\w$.]*\(\))/g, "$1`$2`")
+    .replace(/(^|\s)([\w-]+\.(?:py|ts|tsx|js|vue|md)(?::\d+)?)/g, "$1`$2`")
+    .replace(/"([\w-]+)"/g, "`\"$1\"`");
+}
+
+const STEP_LABEL: Record<string, string> = { ui: "UI", client: "Client", api: "API", service: "Service", runtime: "Runtime", store: "Store", prompt: "Prompt" };
+
 const HALLUCINATIONS = /^(thank you( so much)?( for watching)?|thanks for watching|please subscribe|subtitles? by.*|you|bye|\.+|okay\.?|so\.?|um+\.?|uh+\.?)[.!\s]*$/i;
 /** Drop transcription noise: echoed term lists, repeated phrases, and common silent-audio hallucinations. */
 function cleanTranscript(raw: string) {
@@ -1053,14 +1131,20 @@ function citeOrder(r: Result) {
   const a = r.answer;
   const total = r.hits.length;
   const appear: number[] = [];
-  const txt = [a.answer, ...a.keyPoints].join(" ");
+  const txt = [...(a.path || []).map((p) => (p.cite ? `[${p.cite}]` : "")), a.answer, ...a.keyPoints, a.other || ""].join(" ");
   for (const m of txt.matchAll(/\[(\d+(?:\s*,\s*\d+)*)\]/g)) for (const n of m[1].split(/\s*,\s*/).map(Number)) if (n >= 1 && n <= total && !appear.includes(n)) appear.push(n);
   let citedOrig: number[];
   if (a.mode === "ai") {
     citedOrig = [...appear];
     for (const n of a.cited || []) if (n >= 1 && n <= total && !citedOrig.includes(n)) citedOrig.push(n);
     if (!citedOrig.length) citedOrig = r.hits.slice(0, 3).map((_, i) => i + 1);
-  } else citedOrig = r.hits.slice(0, 4).map((_, i) => i + 1);
+  } else if (a.path?.length) citedOrig = [...appear];
+  else citedOrig = r.hits.slice(0, 4).map((_, i) => i + 1);
+  if (r.trace) {
+    // trace mode: sources follow the hop order, then anything else that was cited
+    const hopN = r.trace.hops.length;
+    citedOrig = [...Array.from({ length: Math.min(hopN, total) }, (_, i) => i + 1), ...citedOrig.filter((n) => n > hopN)];
+  }
   const rest = r.hits.map((_, i) => i + 1).filter((n) => !citedOrig.includes(n));
   const map = new Map<number, number>();
   [...citedOrig, ...rest].forEach((o, i) => map.set(o, i + 1));
@@ -1107,7 +1191,7 @@ function AnswerCard({ r, multi, latest, onFollow }: { r: Result; multi: boolean;
     }, 40);
   };
   const copyAll = () => {
-    const txt = `Q: ${r.question}\n\n${remap(a.answer)}\n\n${a.keyPoints.map((k) => "- " + remap(k)).join("\n")}\n\nSources:\n${cited.map(({ h, n }) => `[${n}] ${shortPath(h)}${h.loc ? ` (${h.loc})` : ""}:${h.start}-${h.end}`).join("\n")}`;
+    const txt = `Q: ${r.question}\n\n${remap(a.answer)}\n\n${(a.path || []).map((p, i) => `${i + 1}. ${p.step}: ${remap(p.text)}`).join("\n")}${a.other ? "\n" + remap(a.other) : ""}${a.openFirst ? `\nOpen first: ${a.openFirst.file}` : ""}\n${a.keyPoints.map((k) => "- " + remap(k)).join("\n")}\n\nSources:\n${cited.map(({ h, n }) => `[${n}] ${shortPath(h)}${h.loc ? ` (${h.loc})` : ""}:${h.start}-${h.end}`).join("\n")}`;
     navigator.clipboard?.writeText(txt.replace(/`/g, ""));
     setCopied(true);
     setTimeout(() => setCopied(false), 1500);
@@ -1117,6 +1201,7 @@ function AnswerCard({ r, multi, latest, onFollow }: { r: Result; multi: boolean;
     <div className={`source ${isOpen(n) ? "open" : ""}`} key={n} ref={(el) => { refs.current[n] = el; }}>
       <button className="source-row" onClick={() => setOpen((o) => ({ ...o, [n]: !isOpen(n) }))} aria-expanded={isOpen(n)}>
         <span className="cite static">{n}</span>
+        {h.hop && <span className={`hop-chip k-${h.hop}`}>{STEP_LABEL[h.hop]}</span>}
         <span className="source-ico">{h.doc ? <FileIcon size={15} /> : <Code size={15} />}</span>
         <span className="source-path">
           {multi && h.src ? <span className="dim">{h.src} › </span> : null}
@@ -1137,7 +1222,7 @@ function AnswerCard({ r, multi, latest, onFollow }: { r: Result; multi: boolean;
           </div>
           <pre className={`code ${h.doc ? "doc" : ""}`}>
             {h.code.split("\n").map((l, j) => {
-              const hit = tokenize(l).some((t) => termSet.has(t));
+              const hit = h.focus ? h.focus.includes(h.start + j) : tokenize(l).some((t) => termSet.has(t));
               return (
                 <div key={j} className={`ln ${hit ? "hit" : ""}`}>
                   <span>{h.start + j}</span>
@@ -1156,6 +1241,7 @@ function AnswerCard({ r, multi, latest, onFollow }: { r: Result; multi: boolean;
       <header className="answer-head">
         <div className="answer-tags">
           {r.heard ? <span className="tag heard"><Mic size={12} /> Heard in meeting</span> : <span className="tag">Asked</span>}
+          {r.trace && <span className="tag tracetag"><Layers size={12} /> Trace</span>}
           {a.mode === "ai" ? <span className="tag ai"><Sparkle size={12} /> {a.model}</span> : <span className="tag"><Bolt size={12} /> From the code</span>}
           <span className={`tag conf ${a.confidence}`}><i />{a.confidence} match</span>
           <span className="tag dim">{r.ms} ms</span>
@@ -1173,6 +1259,51 @@ function AnswerCard({ r, multi, latest, onFollow }: { r: Result; multi: boolean;
       <p className={`answer-text ${loading && a.mode !== "ai" ? "pending" : ""}`}>{renderInline(remap(a.answer), cite)}</p>
       {r.ai === "error" && <div className="alert danger sm">AI couldn&apos;t answer: {r.aiError?.slice(0, 160)}. Showing the instant answer from the code.</div>}
 
+      {a.path && a.path.length > 0 && (
+        <ol className={`trace ${isExpanded ? "" : "compact"}`}>
+          {(isExpanded ? a.path : a.path.slice(0, 4)).map((p, i) => {
+            const h = p.cite ? r.hits[p.cite - 1] : undefined;
+            const kind = (h?.hop || p.step || "").toLowerCase();
+            const line = h ? (h.focus?.find((x) => x !== h.start) ?? h.focus?.[0] ?? h.start) : 0;
+            return (
+              <li key={i} className={`trace-step k-${kind}`}>
+                <span className="trace-rail"><i /></span>
+                <div className="trace-body">
+                  <div className="trace-top">
+                    <span className={`hop-chip k-${kind}`}>{p.step}</span>
+                    {h && (
+                      <button className="trace-file" onClick={() => p.cite && cite(p.cite)} title="Show the code">
+                        <span className="cite static">{remap(`[${p.cite}]`).replace(/[\[\]]/g, "")}</span>
+                        {h.path.split("/").pop()}<span className="dim">:{line}</span>
+                      </button>
+                    )}
+                    {p.verified === false && <span className="tag warn" title="This step's citation doesn't point at traced code that performs the action">Not verified</span>}
+                  </div>
+                  {isExpanded && <div className="trace-text">{renderInline(remap(p.text), cite)}</div>}
+                </div>
+              </li>
+            );
+          })}
+          {!isExpanded && a.path.length > 4 && <li className="trace-more">+{a.path.length - 4} more steps</li>}
+        </ol>
+      )}
+      {isExpanded && a.other && <p className="trace-other">{renderInline(remap(a.other), cite)}</p>}
+      {isExpanded && r.trace && r.trace.stops.length > 0 && a.mode === "ai" && (
+        <div className="trace-stop"><span>Trace stops</span>{r.trace.stops[0]}</div>
+      )}
+      {a.openFirst && (
+        <div className="open-first">
+          <span className="of-label">Open first</span>
+          <code>{a.openFirst.file}</code>
+          {a.openFirst.why && <span className="of-why">{renderInline(a.openFirst.why, cite)}</span>}
+          <button className="icon-btn sm" onClick={() => navigator.clipboard?.writeText(a.openFirst!.file)} title="Copy path" aria-label="Copy path"><Copy size={13} /></button>
+        </div>
+      )}
+
+      {!isExpanded && a.path && a.path.length > 0 && (
+        <button className="more-btn" onClick={() => setExpanded(true)}>Show steps &amp; code <Chevron size={13} /></button>
+      )}
+
       {isExpanded && a.keyPoints.length > 0 && (
         <ul className="points">
           {a.keyPoints.map((k, i) => (
@@ -1181,7 +1312,7 @@ function AnswerCard({ r, multi, latest, onFollow }: { r: Result; multi: boolean;
         </ul>
       )}
 
-      {!isExpanded && cited.length > 0 && (
+      {!isExpanded && cited.length > 0 && !a.path?.length && (
         <button className="collapsed-src" onClick={() => setExpanded(true)}>
           <span className="collapsed-files">
             {cited.slice(0, 3).map(({ h, n }) => (

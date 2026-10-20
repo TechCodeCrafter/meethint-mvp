@@ -37,6 +37,8 @@ export type Hit = {
   code: string;
   score: number;
   matched: string[];
+  focus?: number[]; // trace mode: lines that perform the action
+  hop?: string; // trace mode: ui | client | api | service | runtime | store | prompt
 };
 
 const STOP = new Set(

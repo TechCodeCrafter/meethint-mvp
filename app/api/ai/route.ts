@@ -5,7 +5,7 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
 
-type Snippet = { n: number; path: string; loc?: string; start: number; end: number; code: string; also?: { line: number; text: string }[] };
+type Snippet = { n: number; path: string; loc?: string; start: number; end: number; code: string; also?: { line: number; text: string }[]; focus?: number[]; hop?: string };
 
 const ANSWER_SYS = `You are a senior engineer answering a colleague's question live in a meeting, using ONLY the provided sources (code and documents from their project). The answer is read aloud-in-a-glance, so it must be SHORT.
 Rules:
@@ -34,6 +34,22 @@ const DETECT_SYS = `You listen to a live meeting transcript. Find questions some
 - Only include a question if it's reasonably complete.
 Return ONLY JSON: {"questions": string[]} (usually 0 or 1 items).`;
 
+const TRACE_SYS = `You answer "how does this work / what calls what / which file drives it" questions about the user's repos, live in a meeting. You are given a STATIC TRACE computed from the code (hops: UI -> client -> API route -> service/runtime -> store/prompt) plus the source for each hop. Lines marked ▶ are the action lines found by the tracer.
+Answer ONLY from the attached sources. Rules:
+- Follow the trace one hop at a time: UI function, request it sends, API route, runtime, store. Stop where the code stops; if the trace says it stops, say so instead of guessing.
+- Name the current entry function and the request it sends (method + path) in the first sentence.
+- If an older/other endpoint still exists (listed under "Related routes that exist but NO request ... calls"), mention it in a SEPARATE sentence and say the current UI does not call it. If the frontend isn't loaded, say UI usage is unknown instead.
+- The file that drives a feature is the prompt or caller that chooses the steps, NOT the CRUD/REST wrapper those steps use.
+- Cite only lines that perform the action (calls, requests, route decorators, selection logic, prompt steps). Never cite imports, docstrings, comments, file headers, or UI state updates as proof of the request path. If the only evidence is a stale header/docstring, say the code doesn't show a live call.
+- If more than one runtime/implementation exists, say which one the current call selects (and why, e.g. a default parameter) and what the other is for. Hand-offs through an ARN/URL are matched by name — say "selected via" rather than "calls".
+- Wrap paths, functions, routes and values in backticks. Cite with bare [n] markers only.
+Return ONLY JSON:
+{"answer": "1-2 sentences (max 55 words): entry function + request, and where it lands",
+ "path": [{"step": "UI"|"Client"|"API"|"Runtime"|"Service"|"Store"|"Prompt", "text": "max 22 words: what this hop does, with the action", "cite": n}],
+ "other": "one sentence about the old endpoint and/or other runtime, or empty string",
+ "openFirst": {"file": "path", "why": "max 14 words"},
+ "cited": number[], "confidence": "High"|"Medium"|"Low"}`;
+
 function fixText(f: unknown) {
   if (!Array.isArray(f) || !f.length) return "";
   return `\nName corrections (speech recognition likely mis-heard): ${f.map((x: any) => `"${x.from}" means "${x.to}"`).join(", ")}`;
@@ -58,9 +74,9 @@ function sourcesBlock(snippets: Snippet[]) {
       const code = s.code.slice(0, Math.max(0, Math.min(9000, budget)));
       budget -= code.length;
       if (!code) return "";
-      return `[${s.n}] ${s.path}${s.loc ? ` (${s.loc})` : ""} lines ${s.start}-${s.end}\n\`\`\`\n${code
+      return `[${s.n}]${s.hop ? ` (hop: ${s.hop})` : ""} ${s.path}${s.loc ? ` (${s.loc})` : ""} lines ${s.start}-${s.end}\n\`\`\`\n${code
         .split("\n")
-        .map((l, i) => `${s.start + i}: ${l}`)
+        .map((l, i) => `${s.focus?.includes(s.start + i) ? "▶" : " "}${s.start + i}: ${l}`)
         .join("\n")}\n\`\`\`${
         s.also?.length ? `\nOther lines in this file using the same names:\n${s.also.map((a) => `${a.line}: ${a.text}`).join("\n")}` : ""
       }`;
@@ -73,6 +89,31 @@ export async function POST(req: Request) {
   try {
     const b = await req.json();
     const common = { provider: (b.provider || "openai") as ProviderId, model: b.model, apiKey: b.apiKey };
+    if (b.task === "trace") {
+      if (!b.question || !Array.isArray(b.snippets)) return Response.json({ error: "Missing question or sources" }, { status: 400 });
+      const { text, model } = await callLLM({
+        ...common,
+        system: TRACE_SYS,
+        user: `${b.layout ? `Project folder map (file counts):\n${String(b.layout).slice(0, 3000)}\n\n` : ""}Question: ${String(b.question).slice(0, 2000)}${fixText(b.fixes)}\n\n${String(b.trace || "").slice(0, 6000)}\n\nSources:\n\n${sourcesBlock(b.snippets)}`,
+        maxTokens: 1400,
+      });
+      const out = parseJson(text);
+      const n = b.snippets.length;
+      const okN = (x: unknown) => (typeof x === "number" && x >= 1 && x <= n ? x : undefined);
+      const path = Array.isArray(out.path)
+        ? out.path.slice(0, 9).map((p: any) => ({ step: String(p.step || "").slice(0, 12), text: cleanCites(String(p.text || "")), cite: okN(Number(p.cite)) })).filter((p: any) => p.text)
+        : [];
+      return Response.json({
+        answer: cleanCites(String(out.answer || "")),
+        keyPoints: [],
+        path,
+        other: cleanCites(String(out.other || "")),
+        openFirst: out.openFirst && out.openFirst.file ? { file: String(out.openFirst.file).replace(/`/g, ""), why: String(out.openFirst.why || "") } : undefined,
+        cited: Array.isArray(out.cited) ? out.cited.map(Number).filter((x: number) => okN(x)) : [],
+        confidence: ["High", "Medium", "Low"].includes(out.confidence) ? out.confidence : "Medium",
+        model,
+      });
+    }
     if (b.task === "expand") {
       const paths: string = (b.paths || []).join("\n").slice(0, 14000);
       const { text } = await callLLM({ ...common, system: EXPAND_SYS, user: `Question: ${b.question}${fixText(b.fixes)}\n\nFile paths:\n${paths}`, maxTokens: 400 });

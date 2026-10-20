@@ -8,6 +8,9 @@ export type Answer = {
   mode: "extractive" | "ai";
   model?: string;
   cited?: number[];
+  path?: { step: string; text: string; cite?: number; verified?: boolean }[];
+  other?: string;
+  openFirst?: { file: string; why: string };
 };
 
 type Found = { text: string; path: string; line: number; score: number };
