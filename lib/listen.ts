@@ -84,7 +84,9 @@ export class Listener {
         parts.push(display);
       }
       if (mode !== "meeting") {
-        const mic = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+        // Mic-only: turn off echo cancellation so meeting audio coming out of the speakers isn't removed.
+        const solo = mode === "mic";
+        const mic = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: !solo, noiseSuppression: !solo, autoGainControl: true } });
         this.streams.push(mic);
         parts.push(mic);
       }
@@ -189,7 +191,18 @@ export class Listener {
 export class BrowserSpeech {
   private r: any;
   private stopped = false;
-  constructor(private o: { onText: (t: string) => void; onInterim?: (t: string) => void; onError: (m: string) => void; onEnd: () => void }) {}
+  private fatal = false;
+  private gotResult = false;
+  constructor(
+    private o: {
+      onText: (t: string) => void;
+      onInterim?: (t: string) => void;
+      onError: (m: string) => void;
+      onEnd: () => void;
+      /** Called when the browser's speech service can't be used at all (e.g. "network"). */
+      onFatal?: (code: string) => void;
+    }
+  ) {}
   start() {
     const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
     if (!SR) throw new Error("This browser has no built-in speech recognition. Use Chrome or Edge, or add an OpenAI/Groq key.");
@@ -198,6 +211,7 @@ export class BrowserSpeech {
     r.interimResults = true;
     r.lang = navigator.language || "en-US";
     r.onresult = (e: any) => {
+      this.gotResult = true;
       let interim = "";
       for (let i = e.resultIndex; i < e.results.length; i++) {
         const res = e.results[i];
@@ -208,9 +222,22 @@ export class BrowserSpeech {
     };
     r.onerror = (e: any) => {
       if (e.error === "no-speech" || e.error === "aborted") return;
-      this.o.onError(e.error === "not-allowed" ? "Microphone permission was denied." : `Speech recognition error: ${e.error}`);
+      if (["network", "service-not-allowed", "language-not-supported", "audio-capture"].includes(e.error)) {
+        // Service unavailable (blocked/unreachable). Don't loop; let the app switch engines.
+        this.fatal = true;
+        this.stopped = true;
+        if (this.o.onFatal) return this.o.onFatal(e.error);
+      }
+      this.o.onError(
+        e.error === "not-allowed"
+          ? "Microphone permission was denied. Allow microphone access for this site and try again."
+          : e.error === "network"
+          ? "Your browser's built-in speech service can't be reached (Brave, Arc and some Chromium browsers block it). Add an OpenAI or Groq key in AI settings, or use Google Chrome."
+          : `Speech recognition error: ${e.error}`
+      );
     };
     r.onend = () => {
+      if (this.fatal) return;
       if (!this.stopped) {
         try {
           r.start();

@@ -333,7 +333,8 @@ export default function Page() {
 
   async function startEngine(m: ListenMode) {
     // Microphone: prefer the browser's live speech recognition (words appear as they're spoken).
-    if (m === "mic" && (hasBrowserSpeech() || !stt)) {
+    // If a transcription key is available, use it (most reliable); otherwise the free browser engine.
+    if (m === "mic" && !stt) {
       const b = new BrowserSpeech({
         onText: (t) => {
           setInterim("");
@@ -345,6 +346,22 @@ export default function Page() {
         },
         onError: setListenError,
         onEnd: () => setListening(false),
+        onFatal: (code) => {
+          setInterim("");
+          setSpeaking(false);
+          setListening(false);
+          listenerRef.current = null;
+          if (code !== "audio-capture") setShowAI(true);
+          setListenError(
+            code === "audio-capture"
+              ? "No microphone was found. Check that a mic is connected and allowed for this site (click the icon in the address bar)."
+              : `Your browser's free speech service isn't available here (Brave, Arc and some Chromium browsers block it, or the network does). To fix it: ${
+                  aiReady && provider !== "openai" && provider !== "groq"
+                    ? `${PROVIDERS[provider].label} can't transcribe audio, so open AI settings and paste an OpenAI or Groq key into the “Transcription key” field`
+                    : "open AI settings and add an OpenAI or Groq key"
+                } — transcription then runs through that key and works in any browser. Or open this page in Google Chrome.`
+          );
+        },
       });
       b.start();
       listenerRef.current = b;
