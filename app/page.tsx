@@ -280,7 +280,9 @@ export default function Page() {
   askRef.current = ask;
 
   // ---------- listening ----------
-  async function onHeard(text: string) {
+  async function onHeard(raw: string) {
+    const text = cleanTranscript(raw);
+    if (!text) return;
     const seg: Seg = { id: Date.now() + Math.random(), text, at: Date.now(), q: /\?/.test(text) };
     const earlier = segsRef.current.slice(-8).map((s) => s.text).join(" ");
     segsRef.current = [...segsRef.current, seg].slice(-80);
@@ -320,18 +322,6 @@ export default function Page() {
   const onHeardRef = useRef(onHeard);
   onHeardRef.current = onHeard;
 
-  function vocabPrompt() {
-    const idx = indexRef.current;
-    if (!idx) return "";
-    const names = new Set<string>();
-    for (const f of idx.files) {
-      const base = f.path.split("/").pop()!.replace(/\.[a-z0-9]+$/i, "");
-      if (base.length > 2 && !/^(index|main|test|utils?)$/i.test(base)) names.add(base);
-      if (names.size > 80) break;
-    }
-    return `Software project meeting. Terms: ${[...names].join(", ")}.`;
-  }
-
   async function startEngine(m: ListenMode) {
     // Microphone: prefer the browser's live speech recognition (words appear as they're spoken).
     // If a transcription key is available, use it (most reliable); otherwise the free browser engine.
@@ -370,7 +360,6 @@ export default function Page() {
       return;
     }
     if (!stt) throw new Error("Listening to meeting audio needs a transcription key (OpenAI or Groq) — open AI settings. Or switch to “My microphone” to use free live browser speech recognition.");
-    const prompt = vocabPrompt();
     const l = new Listener({
       mode: m,
       transcribe: async (blob) => {
@@ -378,7 +367,6 @@ export default function Page() {
         fd.append("file", blob, "seg.webm");
         fd.append("provider", stt.provider);
         if (stt.key) fd.append("apiKey", stt.key);
-        fd.append("prompt", prompt);
         const r = await fetch("/api/transcribe", { method: "POST", body: fd });
         const j = await r.json();
         if (!r.ok) throw new Error(j.error || "Transcription failed");
@@ -838,7 +826,7 @@ export default function Page() {
                           {latestResult.ai === "searching" || latestResult.ai === "writing" ? (
                             <div className="thinking"><span className="spinner" />{latestResult.ai === "searching" ? "Searching your code…" : "Writing answer…"}</div>
                           ) : null}
-                          <p className="heard-a">{renderInline(latestResult.answer.answer, () => scrollToResult(latestResult.id))}</p>
+                          <p className="heard-a">{renderInline(citeOrder(latestResult).remap(latestResult.answer.answer), () => scrollToResult(latestResult.id))}</p>
                           <button className="btn ghost sm" onClick={() => scrollToResult(latestResult.id)}>Sources & code <Chevron size={14} /></button>
                         </>
                       ) : (
@@ -899,8 +887,8 @@ export default function Page() {
 
           {/* ---------- Answers feed ---------- */}
           <div className="feed" aria-live="polite">
-            {results.map((r) => (
-              <AnswerCard key={r.id} r={r} multi={sources.length > 1} onFollow={(q) => { setQuestion(q); qRef.current?.focus(); }} />
+            {results.map((r, i) => (
+              <AnswerCard key={r.id} r={r} latest={i === 0} multi={sources.length > 1} onFollow={(q) => { setQuestion(q); qRef.current?.focus(); }} />
             ))}
             {hasSource && !results.length && !showLive && (
               <div className="feed-empty">
@@ -982,6 +970,24 @@ function timeAgo(t: number, now: number) {
   return s < 5 ? "just now" : s < 60 ? `${s}s ago` : `${Math.round(s / 60)} min ago`;
 }
 
+const HALLUCINATIONS = /^(thank you( so much)?( for watching)?|thanks for watching|please subscribe|subtitles? by.*|you|bye|\.+|okay\.?|so\.?|um+\.?|uh+\.?)[.!\s]*$/i;
+/** Drop transcription noise: echoed term lists, repeated phrases, and common silent-audio hallucinations. */
+function cleanTranscript(raw: string) {
+  const t = raw.replace(/\s+/g, " ").trim();
+  if (!t || HALLUCINATIONS.test(t)) return "";
+  const words = t.split(" ");
+  const commas = (t.match(/,/g) || []).length;
+  // "provider, ws_client, __init__, client, config, ..." — a list of identifiers, not speech
+  if (words.length >= 6 && commas / words.length > 0.35) return "";
+  const codey = words.filter((w) => /[_/]|[a-z][A-Z]|^Terms:/.test(w)).length;
+  if (words.length >= 6 && codey / words.length > 0.4) return "";
+  if (/^Software project meeting\. Terms:/i.test(t)) return "";
+  // the same short phrase repeated over and over
+  const uniq = new Set(words.map((w) => w.toLowerCase().replace(/[^a-z0-9]/g, "")));
+  if (words.length >= 12 && uniq.size / words.length < 0.25) return "";
+  return t;
+}
+
 function renderInline(text: string, onCite: (n: number) => void) {
   const parts = text.split(/(`[^`]+`|\[\d+(?:\s*,\s*\d+)*\])/g);
   return parts.map((p, i) => {
@@ -999,21 +1005,54 @@ function renderInline(text: string, onCite: (n: number) => void) {
   });
 }
 
-function AnswerCard({ r, multi, onFollow }: { r: Result; multi: boolean; onFollow: (q: string) => void }) {
+/** Number cited sources 1..n in the order they appear in the answer; other matches continue after. */
+function citeOrder(r: Result) {
+  const a = r.answer;
+  const total = r.hits.length;
+  const appear: number[] = [];
+  const txt = [a.answer, ...a.keyPoints].join(" ");
+  for (const m of txt.matchAll(/\[(\d+(?:\s*,\s*\d+)*)\]/g)) for (const n of m[1].split(/\s*,\s*/).map(Number)) if (n >= 1 && n <= total && !appear.includes(n)) appear.push(n);
+  let citedOrig: number[];
+  if (a.mode === "ai") {
+    citedOrig = [...appear];
+    for (const n of a.cited || []) if (n >= 1 && n <= total && !citedOrig.includes(n)) citedOrig.push(n);
+    if (!citedOrig.length) citedOrig = r.hits.slice(0, 3).map((_, i) => i + 1);
+  } else citedOrig = r.hits.slice(0, 4).map((_, i) => i + 1);
+  const rest = r.hits.map((_, i) => i + 1).filter((n) => !citedOrig.includes(n));
+  const map = new Map<number, number>();
+  [...citedOrig, ...rest].forEach((o, i) => map.set(o, i + 1));
+  const remap = (t: string) =>
+    t.replace(/\[(\d+(?:\s*,\s*\d+)*)\]/g, (_, g: string) =>
+      g.split(/\s*,\s*/).map(Number).filter((n) => map.has(n)).map((n) => `[${map.get(n)}]`).join("")
+    );
+  return {
+    cited: citedOrig.map((o) => ({ h: r.hits[o - 1], n: map.get(o)! })),
+    other: rest.map((o) => ({ h: r.hits[o - 1], n: map.get(o)! })),
+    remap,
+  };
+}
+
+/** Path for display: drop a leading folder that just repeats the source name. */
+function shortPath(h: Hit) {
+  if (h.src && h.path.startsWith(h.src + "/")) return h.path.slice(h.src.length + 1);
+  return h.path;
+}
+
+function AnswerCard({ r, multi, latest, onFollow }: { r: Result; multi: boolean; latest: boolean; onFollow: (q: string) => void }) {
   const refs = useRef<Record<number, HTMLDivElement | null>>({});
   const [open, setOpen] = useState<Record<number, boolean>>({});
   const [showOther, setShowOther] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [expanded, setExpanded] = useState<boolean | null>(null);
+  const isExpanded = expanded ?? latest;
   const termSet = useMemo(() => new Set(expandQuery(r.question).filter((t) => t.original).map((t) => t.term)), [r.question]);
   const a = r.answer;
-  const numbered = r.hits.map((h, i) => ({ h, n: i + 1 }));
-  const cited = a.mode === "ai" && a.cited?.length ? numbered.filter((x) => a.cited!.includes(x.n)) : a.mode === "ai" ? numbered.slice(0, 3) : numbered.slice(0, 4);
-  const other = numbered.filter((x) => !cited.includes(x));
-  const firstN = cited[0]?.n;
-  const isOpen = (n: number) => (open[n] ?? n === firstN);
+  const { cited, other, remap } = citeOrder(r);
+  const isOpen = (n: number) => !!open[n];
   const loading = r.ai === "searching" || r.ai === "writing";
 
   const cite = (n: number) => {
+    setExpanded(true);
     if (!cited.some((x) => x.n === n)) setShowOther(true);
     setOpen((o) => ({ ...o, [n]: true }));
     setTimeout(() => {
@@ -1025,7 +1064,7 @@ function AnswerCard({ r, multi, onFollow }: { r: Result; multi: boolean; onFollo
     }, 40);
   };
   const copyAll = () => {
-    const txt = `Q: ${r.question}\n\n${a.answer}\n\n${a.keyPoints.map((k) => "- " + k).join("\n")}\n\nSources:\n${cited.map(({ h, n }) => `[${n}] ${h.path}${h.loc ? ` (${h.loc})` : ""}:${h.start}-${h.end}`).join("\n")}`;
+    const txt = `Q: ${r.question}\n\n${remap(a.answer)}\n\n${a.keyPoints.map((k) => "- " + remap(k)).join("\n")}\n\nSources:\n${cited.map(({ h, n }) => `[${n}] ${shortPath(h)}${h.loc ? ` (${h.loc})` : ""}:${h.start}-${h.end}`).join("\n")}`;
     navigator.clipboard?.writeText(txt.replace(/`/g, ""));
     setCopied(true);
     setTimeout(() => setCopied(false), 1500);
@@ -1038,7 +1077,7 @@ function AnswerCard({ r, multi, onFollow }: { r: Result; multi: boolean; onFollo
         <span className="source-ico">{h.doc ? <FileIcon size={15} /> : <Code size={15} />}</span>
         <span className="source-path">
           {multi && h.src ? <span className="dim">{h.src} › </span> : null}
-          {h.path.includes("/") ? <span className="dim">{h.path.slice(0, h.path.lastIndexOf("/") + 1)}</span> : null}
+          {shortPath(h).includes("/") ? <span className="dim">{shortPath(h).slice(0, shortPath(h).lastIndexOf("/") + 1)}</span> : null}
           <b>{h.path.split("/").pop()}</b>
         </span>
         <span className="source-loc">{h.loc ? h.loc : `L${h.start}–${h.end}`}</span>
@@ -1088,18 +1127,29 @@ function AnswerCard({ r, multi, onFollow }: { r: Result; multi: boolean; onFollo
       {loading && a.mode !== "ai" && (
         <div className="thinking"><span className="spinner" />{r.ai === "searching" ? "Searching deeper…" : "Writing a clear answer…"}<span className="shimmer" /></div>
       )}
-      <p className={`answer-text ${loading && a.mode !== "ai" ? "pending" : ""}`}>{renderInline(a.answer, cite)}</p>
+      <p className={`answer-text ${loading && a.mode !== "ai" ? "pending" : ""}`}>{renderInline(remap(a.answer), cite)}</p>
       {r.ai === "error" && <div className="alert danger sm">AI couldn&apos;t answer: {r.aiError?.slice(0, 160)}. Showing the instant answer from the code.</div>}
 
-      {a.keyPoints.length > 0 && (
+      {isExpanded && a.keyPoints.length > 0 && (
         <ul className="points">
           {a.keyPoints.map((k, i) => (
-            <li key={i}>{renderInline(k, cite)}</li>
+            <li key={i}>{renderInline(remap(k), cite)}</li>
           ))}
         </ul>
       )}
 
-      {cited.length > 0 && (
+      {!isExpanded && cited.length > 0 && (
+        <button className="collapsed-src" onClick={() => setExpanded(true)}>
+          <span className="collapsed-files">
+            {cited.slice(0, 3).map(({ h, n }) => (
+              <span key={n} className="mini-src"><span className="cite static">{n}</span>{h.path.split("/").pop()}</span>
+            ))}
+          </span>
+          <span className="collapsed-more">{a.keyPoints.length ? "Details & code" : "Show code"} <Chevron size={13} /></span>
+        </button>
+      )}
+
+      {isExpanded && cited.length > 0 && (
         <div className="sources">
           <div className="sources-label">Sources</div>
           {cited.map(renderSrc)}

@@ -87,11 +87,14 @@ const SYNONYMS: Record<string, string[]> = {
 
 function stem(w: string): string {
   if (w.length <= 4) return w;
-  if (w.endsWith("ies")) return w.slice(0, -3) + "y";
+  if (w.endsWith("ies")) w = w.slice(0, -3) + "y";
+  else if (w.endsWith("es") && /(ss|x|ch|sh)es$/.test(w)) w = w.slice(0, -2);
+  else if (w.endsWith("s") && !w.endsWith("ss") && !w.endsWith("us")) w = w.slice(0, -1);
   if (w.endsWith("ing") && w.length > 6) return w.slice(0, -3);
   if (w.endsWith("ed") && w.length > 5) return w.slice(0, -2);
-  if (w.endsWith("es") && /(ss|x|ch|sh)es$/.test(w)) return w.slice(0, -2);
-  if (w.endsWith("s") && !w.endsWith("ss")) return w.slice(0, -1);
+  if (w.endsWith("ation") && w.length > 8) return w.slice(0, -5);
+  if (/[ts]ion$/.test(w) && w.length > 7) return w.slice(0, -3);
+  if (/(ate|ize|ise)$/.test(w) && w.length > 6) return w.slice(0, -3);
   return w;
 }
 
