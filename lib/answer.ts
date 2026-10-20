@@ -61,6 +61,7 @@ function cleanComment(l: string) {
     .trim()
     .replace(/^(\/\/+|#+|\/\*+|\*+\/?|"""|'''|--)\s?/, "")
     .replace(/\*\/\s*$/, "")
+    .replace(/("""|\'\'\')\s*$/, "")
     .replace(/^@\w+\s*/, "")
     .trim();
 }
@@ -175,6 +176,24 @@ export function extractiveAnswer(question: string, hits: Hit[]): Answer {
   const mainDef = inTop[0] || tDefs.find((d) => d.path === h0.path) || tDefs[0];
 
   const parts: string[] = [];
+  if (h0.doc) {
+    const lines = h0.code.split("\n");
+    const ranked = lines
+      .map((l, i) => ({ l: l.trim(), i, s: overlap(l) }))
+      .filter((x) => x.s > 0 && !/^\[(Page|Slide|Sheet|Cell) /.test(x.l) && x.l.length > 3)
+      .sort((a, b) => b.s - a.s)
+      .slice(0, 2)
+      .sort((a, b) => a.i - b.i);
+    const where = `\`${h0.path}\`${h0.loc ? ` (${h0.loc})` : ""}`;
+    if (ranked.length) {
+      const quote = ranked.map((x) => x.l).join(" … ");
+      parts.push(`From ${where}: “${quote.length > 400 ? quote.slice(0, 397) + "…" : quote}”`);
+    } else parts.push(`The best match is ${where}.`);
+    const rest = hits.slice(1, 3).filter((h) => h.path !== h0.path);
+    if (rest.length) parts.push(`Also see ${rest.map((o) => `\`${o.path}\`${o.loc ? ` (${o.loc})` : ""}`).join(" and ")}.`);
+    const coverage = orig.size ? h0.matched.filter((m) => orig.has(m)).length / orig.size : 0;
+    return { answer: parts.join(" "), keyPoints: tVals.filter((v) => v.path === h0.path).slice(0, 3).map((v) => `\`${v.text}\``), confidence: coverage >= 0.66 ? "High" : coverage >= 0.34 ? "Medium" : "Low", mode: "extractive" };
+  }
   if (isValue && tVals.length && tVals[0].score > 0.4) {
     const v = tVals[0];
     parts.push(`The current value is \`${v.text}\`, set in ${rel(v.path, v.line)}.`);
@@ -189,7 +208,7 @@ export function extractiveAnswer(question: string, hits: Hit[]): Answer {
     parts.push(
       mainDef
         ? `This is handled by \`${mainDef.text}\` in ${rel(mainDef.path, mainDef.line)}; the relevant section is lines ${h0.start}–${h0.end}.`
-        : `The most relevant code is in ${rel(h0.path, h0.start, h0.end)}.`
+        : `The most relevant section is ${rel(h0.path, h0.start, h0.end)}.`
     );
     const here = mainDef?.path || h0.path;
     const c = tComments.find((x) => x.path === here) || tComments[0];

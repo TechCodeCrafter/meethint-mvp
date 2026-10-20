@@ -1,9 +1,11 @@
 // Client-side code retrieval: chunking + BM25 with code-aware tokenization.
 
-export type CodeFile = { path: string; content: string };
+export type Origin = { owner: string; repo: string; sha: string };
+export type CodeFile = { path: string; content: string; origin?: Origin; doc?: boolean; src?: string; key?: string };
 
 export type Chunk = {
   id: number;
+  key: string;
   path: string;
   start: number; // 1-based line
   end: number; // inclusive
@@ -15,6 +17,7 @@ export type Chunk = {
 
 export type Index = {
   files: CodeFile[];
+  byKey: Map<string, CodeFile>;
   chunks: Chunk[];
   df: Map<string, number>;
   avgLen: number;
@@ -22,7 +25,12 @@ export type Index = {
 };
 
 export type Hit = {
+  key: string;
   path: string;
+  src?: string;
+  origin?: Origin;
+  doc?: boolean;
+  loc?: string;
   start: number;
   end: number;
   code: string;
@@ -142,7 +150,10 @@ export function buildIndex(files: CodeFile[]): Index {
   let totalLen = 0;
   let lineCount = 0;
   let id = 0;
+  const byKey = new Map<string, CodeFile>();
   for (const f of files) {
+    f.key = f.key || (f.src ? f.src + "::" : "") + f.path;
+    byKey.set(f.key, f);
     const lines = f.content.split(/\r?\n/);
     lineCount += lines.length;
     const pathTokens = new Set(tokenize(f.path.replace(/\.[a-z0-9]+$/i, "")));
@@ -154,12 +165,12 @@ export function buildIndex(files: CodeFile[]): Index {
       for (const t of toks) tf.set(t, (tf.get(t) || 0) + 1);
       for (const t of pathTokens) tf.set(t, (tf.get(t) || 0) + 2);
       for (const t of tf.keys()) df.set(t, (df.get(t) || 0) + 1);
-      chunks.push({ id: id++, path: f.path, start: s + 1, end: e, lines: slice, tf, len: toks.length, pathTokens });
+      chunks.push({ id: id++, key: f.key, path: f.path, start: s + 1, end: e, lines: slice, tf, len: toks.length, pathTokens });
       totalLen += toks.length;
       if (e >= lines.length) break;
     }
   }
-  return { files, chunks, df, avgLen: totalLen / Math.max(1, chunks.length), lineCount };
+  return { files, byKey, chunks, df, avgLen: totalLen / Math.max(1, chunks.length), lineCount };
 }
 
 function isTestPath(p: string) {
@@ -169,8 +180,12 @@ function isDocPath(p: string) {
   return /\.(md|mdx|txt|rst)$/i.test(p);
 }
 
-export function search(index: Index, question: string, k = 6): Hit[] {
+export function search(index: Index, question: string, k = 6, opts: { boost?: Set<string>; extra?: string } = {}): Hit[] {
   const terms = expandQuery(question);
+  if (opts.extra) {
+    const have = new Set(terms.map((t) => t.term));
+    for (const t of tokenize(opts.extra)) if (!have.has(t)) { have.add(t); terms.push({ term: t, weight: 0.6, original: false }); }
+  }
   if (!terms.length) return [];
   const N = index.chunks.length;
   const k1 = 1.3,
@@ -197,6 +212,7 @@ export function search(index: Index, question: string, k = 6): Hit[] {
     const origCount = terms.filter((t) => t.original).length || 1;
     s *= 0.6 + 0.8 * (origHits / origCount);
     if (!wantsTests && isTestPath(c.path)) s *= 0.55;
+    if (opts.boost?.has(c.path)) s *= 1.8;
     if (!wantsDocs && isDocPath(c.path)) s *= 0.7;
     scored.push({ c, s, m });
   }
@@ -209,15 +225,36 @@ export function search(index: Index, question: string, k = 6): Hit[] {
   const weightOf = new Map(terms.map((t) => [t.term, t.weight]));
   for (const { c, s, m } of scored) {
     if (hits.length >= k) break;
-    if ((perFile.get(c.path) || 0) >= 2) continue;
+    if ((perFile.get(c.key) || 0) >= 2) continue;
     const win = focusWindow(c, termSet, weightOf);
-    if (taken.some((t) => t.path === c.path && !(win.end < t.start - 3 || win.start > t.end + 3))) continue;
-    taken.push({ path: c.path, ...win });
-    perFile.set(c.path, (perFile.get(c.path) || 0) + 1);
-    const file = index.files.find((f) => f.path === c.path)!;
+    if (taken.some((t) => t.path === c.key && !(win.end < t.start - 3 || win.start > t.end + 3))) continue;
+    taken.push({ path: c.key, ...win });
+    perFile.set(c.key, (perFile.get(c.key) || 0) + 1);
+    const file = index.byKey.get(c.key)!;
     const all = file.content.split(/\r?\n/);
+    let loc: string | undefined;
+    if (file.doc) {
+      const MARK = /^\[((Page|Slide|Sheet|Cell) ([^\]]+))\]$/;
+      let first: RegExpMatchArray | null = null;
+      for (let i = win.start - 1; i >= 0; i--) {
+        const m = all[i].match(MARK);
+        if (m) { first = m; break; }
+      }
+      let last: RegExpMatchArray | null = null;
+      for (let i = win.start; i < win.end; i++) {
+        const m = all[i]?.match(MARK);
+        if (m) last = m;
+      }
+      if (!first && last) first = last;
+      if (first) loc = last && last[1] !== first[1] && last[2] === first[2] ? `${first[2]}s ${first[3]}–${last[3]}` : first[1];
+    }
     hits.push({
+      key: c.key,
       path: c.path,
+      src: file.src,
+      origin: file.origin,
+      doc: file.doc,
+      loc,
       start: win.start,
       end: win.end,
       code: all.slice(win.start - 1, win.end).join("\n"),
