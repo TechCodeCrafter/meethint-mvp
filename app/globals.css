@@ -172,3 +172,9 @@ details.token .row { margin-top: 8px; }
   .ans-text { font-size: 16px; }
   .ans { padding: 14px 14px 6px; }
 }
+.results > * { min-width: 0; }
+.ans { min-width: 0; overflow: hidden; }
+.ans-text code, .kp code { overflow-wrap: anywhere; }
+.chip { text-align: left; }
+.results { grid-template-columns: minmax(0, 1fr); }
+code, pre, .mono, .input.mono { font-variant-ligatures: none; font-feature-settings: "liga" 0, "calt" 0; }
