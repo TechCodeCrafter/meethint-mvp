@@ -4,7 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { buildIndex, search, mergeAdjacent, correctTerms, tokenize, expandQuery, type Hit, type Index, type CodeFile } from "@/lib/search";
 import { extractiveAnswer, type Answer } from "@/lib/answer";
 import { buildTrace, getGraph, traceHits, traceText, traceAnswer, isFlowQuestion, isNonEvidence, type Trace } from "@/lib/trace";
-import { loadGitHub, loadUploaded, filesFromDrop } from "@/lib/loaders";
+import { loadUploaded, filesFromDrop } from "@/lib/loaders";
 import { DEMO_FILES } from "@/lib/demo";
 import { PROVIDERS, type ProviderId } from "@/lib/providers";
 import { runTask } from "@/lib/ai-core";
@@ -13,7 +13,7 @@ import { findDuplicate } from "@/lib/dedupe";
 import { splitTldr } from "@/lib/tldr";
 import { verifyCitations } from "@/lib/verify";
 import { updateMomentum, momentumBoost, type Momentum } from "@/lib/momentum";
-import { Mic, Stop, Github, Folder, FileIcon, Code, Sparkle, Gear, X, Copy, Check, External, Chevron, Search, Sun, Moon, Lock, Arrow, Monitor, Layers, Reply, Menu, Bolt } from "./icons";
+import { Mic, Stop,  Folder, FileIcon, Code, Sparkle, Gear, X, Copy, Check, External, Chevron, Search, Sun, Moon, Lock, Arrow, Monitor, Layers, Reply, Menu, Bolt } from "./icons";
 import { Listener, BrowserSpeech, NoAudioError, canCaptureMeetingAudio, hasBrowserSpeech, heuristicQuestions, type ListenMode } from "@/lib/listen";
 
 type Source = {
@@ -47,7 +47,6 @@ type Result = {
 type Seg = { id: number; text: string; at: number; q?: boolean };
 type Detected = { id: number; q: string; answered: boolean; at: number; resultId?: number; repeats?: number };
 
-const EXAMPLE_REPOS = ["sindresorhus/ky", "expressjs/express", "vercel/swr", "supabase/supabase-js"];
 const DEMO_QUESTIONS = [
   "How does the payment retry logic work?",
   "Where do we store user preferences?",
@@ -62,9 +61,7 @@ export default function Page() {
   const [sources, setSources] = useState<Source[]>([]);
   const indexRef = useRef<Index | null>(null);
   const [addOpen, setAddOpen] = useState(true);
-  const [tab, setTab] = useState<"github" | "upload" | "demo">("github");
-  const [repoInput, setRepoInput] = useState("");
-  const [ghToken, setGhToken] = useState("");
+  const [tab, setTab] = useState<"upload" | "demo">("upload");
   const [progress, setProgress] = useState<{ msg: string; pct: number } | null>(null);
   const [loadError, setLoadError] = useState("");
   const [over, setOver] = useState(false);
@@ -194,19 +191,6 @@ export default function Page() {
       if (!next.length) setAddOpen(true);
       return next;
     });
-  }
-
-  async function connectGitHub(input = repoInput) {
-    setLoadError("");
-    setProgress({ msg: "Connecting…", pct: 1 });
-    try {
-      const r = await loadGitHub(input, ghToken.trim() || undefined, (msg, pct) => setProgress((p) => ({ msg, pct: pct ?? p?.pct ?? 0 })));
-      addSource(r, "github");
-      setRepoInput("");
-    } catch (e: any) {
-      setProgress(null);
-      setLoadError(e.message || String(e));
-    }
   }
 
   async function handleFiles(list: File[]) {
@@ -553,7 +537,6 @@ export default function Page() {
 
   // ---------- UI-only state ----------
   const [theme, setTheme] = useState<"light" | "dark">("dark");
-  const [ghOpen, setGhOpen] = useState(false);
   const [listenSetup, setListenSetup] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [navOpen, setNavOpen] = useState(false);
@@ -620,7 +603,6 @@ export default function Page() {
     if (e.key === "Escape") {
       setShowAI(false);
       setListenSetup(false);
-      setGhOpen(false);
       setNavOpen(false);
       return;
     }
@@ -679,12 +661,12 @@ export default function Page() {
             {hasSource && <span className="count">{totals.files.toLocaleString()} files</span>}
           </div>
 
-          {sources.length === 0 && !progress && <p className="side-empty">Nothing connected yet. Add a repo, folders, files or docs.</p>}
+          {sources.length === 0 && !progress && <p className="side-empty">Nothing added yet. Add a folder, files or docs.</p>}
 
           <ul className="src-list">
             {sources.map((s) => (
               <li key={s.id} className="src-item">
-                <span className={`src-ico ${s.kind}`}>{s.kind === "github" ? <Github size={15} /> : s.kind === "demo" ? <Sparkle size={15} /> : <Folder size={15} />}</span>
+                <span className={`src-ico ${s.kind}`}>{s.kind === "demo" ? <Sparkle size={15} /> : <Folder size={15} />}</span>
                 <div className="src-body">
                   <div className="src-name" title={s.label}>{s.label}</div>
                   <div className="src-meta">
@@ -707,9 +689,6 @@ export default function Page() {
           {loadError && <div className="alert danger sm" role="alert">{loadError}<button className="icon-btn sm" onClick={() => setLoadError("")} aria-label="Dismiss"><X size={13} /></button></div>}
 
           <div className="add-grid">
-            <button className={`add-btn ${ghOpen ? "active" : ""}`} onClick={() => setGhOpen((o) => !o)} disabled={!!progress}>
-              <Github size={16} /> GitHub repo
-            </button>
             <button className="add-btn" onClick={() => folderRef.current?.click()} disabled={!!progress}>
               <Folder size={16} /> Folder
             </button>
@@ -723,28 +702,6 @@ export default function Page() {
           <input ref={folderRef} type="file" multiple hidden onChange={(e) => handleFiles([...(e.target.files || [])])} />
           <input ref={filesRef} type="file" multiple hidden accept={ACCEPT} onChange={(e) => handleFiles([...(e.target.files || [])])} />
 
-          {ghOpen && (
-            <form className="gh-form" onSubmit={(e) => { e.preventDefault(); connectGitHub(); setGhOpen(false); }}>
-              <input
-                autoFocus
-                className="field mono"
-                placeholder="owner/repo or GitHub URL"
-                value={repoInput}
-                onChange={(e) => setRepoInput(e.target.value)}
-                aria-label="GitHub repository"
-                autoCapitalize="off"
-                autoCorrect="off"
-                spellCheck={false}
-              />
-              <input className="field mono" type="password" autoComplete="off" placeholder="Token for private repos (optional)" value={ghToken} onChange={(e) => setGhToken(e.target.value)} aria-label="GitHub token" />
-              <button className="btn primary block" disabled={!repoInput.trim()}>Connect repository</button>
-              <div className="gh-try">
-                {EXAMPLE_REPOS.map((r) => (
-                  <button type="button" key={r} className="tiny-chip" onClick={() => { connectGitHub(r); setGhOpen(false); }}>{r}</button>
-                ))}
-              </div>
-            </form>
-          )}
           <p className="side-hint">Drop folders, files, PDFs or .zip anywhere on the page. Dependencies and build folders are skipped.</p>
         </div>
 
@@ -786,7 +743,7 @@ export default function Page() {
                 value={question}
                 onChange={(e) => setQuestion(e.target.value)}
                 onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); ask(); } }}
-                placeholder={hasSource ? "Ask anything about the code or docs…" : "Connect a repo or drop files to start"}
+                placeholder={hasSource ? "Ask anything about the code or docs…" : "Add a folder or drop files to start"}
                 aria-label="Question"
                 disabled={!hasSource}
               />
@@ -962,17 +919,17 @@ export default function Page() {
             <section className="hero">
               <span className="eyebrow"><span className="live-dot static" /> Built for live meetings</span>
               <h1>Someone asks about the code.<br /><em>You answer in seconds.</em></h1>
-              <p className="lead">Connect a repo or drop your files. Ask, or let it listen to the call. Answers come from the actual code, with the exact file, lines and page.</p>
+              <p className="lead">Drop in your project folder or files. Ask, or let it listen to the call. Answers come from the actual code, with the exact file, lines and page.</p>
               <div className="start-grid">
-                <button className="start-card" onClick={() => setGhOpen(true)}>
-                  <span className="start-ico"><Github size={22} /></span>
-                  <span className="start-title">Connect GitHub</span>
-                  <span className="start-desc">Any public repo in one click, private with a token.</span>
-                </button>
                 <button className="start-card" onClick={() => folderRef.current?.click()}>
                   <span className="start-ico"><Folder size={22} /></span>
                   <span className="start-title">Upload a folder</span>
-                  <span className="start-desc">Code, PDF, Word, slides, sheets. Read in your browser.</span>
+                  <span className="start-desc">Your project folder. Read in your browser, never uploaded to a server.</span>
+                </button>
+                <button className="start-card" onClick={() => filesRef.current?.click()}>
+                  <span className="start-ico"><FileIcon size={22} /></span>
+                  <span className="start-title">Add files & docs</span>
+                  <span className="start-desc">Code files, .zip, PDF, Word, slides and sheets.</span>
                 </button>
                 <button className="start-card" onClick={loadDemo}>
                   <span className="start-ico"><Sparkle size={22} /></span>
@@ -981,7 +938,7 @@ export default function Page() {
                 </button>
               </div>
               <ol className="flow">
-                <li><span>1</span>Connect code & docs</li>
+                <li><span>1</span>Add code & docs</li>
                 <li><span>2</span>Ask or listen</li>
                 <li><span>3</span>Answer with exact sources</li>
               </ol>
@@ -1036,7 +993,7 @@ export default function Page() {
                     </div>
                     <p>
                       Your browser sends the key straight to {PROVIDERS[provider].label}. This site&apos;s server never receives it: its AI routes refuse any request that carries a key,
-                      and the page&apos;s security policy only allows connections to AI providers and GitHub. Check it yourself in DevTools → Network.
+                      and the page&apos;s security policy only allows connections to the AI providers. Check it yourself in DevTools → Network.
                       Nothing is saved; closing the tab forgets it.
                     </p>
                   </>

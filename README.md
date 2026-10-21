@@ -8,7 +8,7 @@ Hosted: https://code-meeting-answerer.vercel.app
 
 - **With your own key:** the browser calls the AI provider directly (`api.openai.com`, `api.anthropic.com`, `api.x.ai` or `api.groq.com`). This site's server never receives the key or your code.
 - **Server routes refuse keys:** `/api/ai` and `/api/transcribe` reject any request that includes an API key. They only work as a relay for keys that a self-hoster sets in the server environment.
-- **Locked connections:** a Content-Security-Policy (`next.config.mjs`) only allows connections to this origin, the four AI providers and GitHub.
+- **Locked connections:** a Content-Security-Policy (`next.config.mjs`) only allows connections to this origin and the four AI providers. GitHub connections are blocked; the app doesn't connect to GitHub at all.
 - **Check it yourself:** open DevTools → Network while you ask a question.
 - **Without a key:** answers come from local code search, and nothing leaves the tab.
 
@@ -38,7 +38,7 @@ GROQ_API_KEY=...        # answers + Whisper transcription
 
 ## What it does
 
-- **Sources:** a public or private GitHub repo, or uploaded folders, files and documents (PDF, DOCX, PPTX, XLSX, ZIP). Dependency and build folders are skipped.
+- **Sources:** upload a project folder, files or documents (code, ZIP, PDF, DOCX, PPTX, XLSX). Everything is read in the browser and never uploaded. Dependency and build folders are skipped. There's no GitHub connection.
 - **Ask or listen:** type a question, or let it listen to the meeting (tab audio, microphone or both). Questions are detected in the transcript and answered automatically. Re-asked or re-transcribed questions within 90 seconds are merged, not answered twice.
 - **Grounded answers, TL;DR first:** an instant answer from code-aware search appears right away. The AI write-up streams in on top of it (OpenAI, Anthropic, xAI or Groq). Every claim cites a file and line range.
 - **Citation check:** every backticked name, path or value in a cited sentence must appear in the source it cites. If one doesn't, the answer is flagged and its confidence label drops one level.

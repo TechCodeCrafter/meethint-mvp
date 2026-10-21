@@ -123,6 +123,7 @@ kbd { font-size: 11px; padding: 1px 6px; border-radius: 5px; border: 1px solid v
 .bar { height: 3px; border-radius: 3px; background: var(--line); overflow: hidden; }
 .bar i { display: block; height: 100%; background: var(--accent); transition: width .25s; box-shadow: 0 0 12px var(--accent); }
 .add-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.add-grid > :last-child:nth-child(odd) { grid-column: span 2; }
 .add-btn {
   display: flex; align-items: center; gap: 8px; padding: 9px 10px; border-radius: 10px; font-size: 13px; font-weight: 550;
   background: transparent; border: 1px dashed var(--line-2); color: var(--ink-2); transition: all .15s;
